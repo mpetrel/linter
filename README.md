@@ -1,4 +1,4 @@
-# mdedit
+# linter
 
 A small Typora-style Markdown editor written in Rust with [Slint](https://slint.dev).
 
@@ -76,9 +76,9 @@ make a line break).
 
 - **Drag and drop on Linux:** winit can't receive dropped files on Wayland. When XWayland
   is available (`DISPLAY` is set), the app runs through it so drops work. Set
-  `MDEDIT_WAYLAND=1` to run as a native Wayland client instead, without drag and drop.
+  `LINTER_WAYLAND=1` to run as a native Wayland client instead, without drag and drop.
 - **Input methods on Linux:** through XWayland, an IBus input method (for example Rime
-  or Pinyin) can drop or delay keys, such as repeated spaces. `MDEDIT_WAYLAND=1` uses
+  or Pinyin) can drop or delay keys, such as repeated spaces. `LINTER_WAYLAND=1` uses
   the Wayland input-method support instead.
 - Links aren't opened on click (a click edits the block). Remote images aren't downloaded.
 - Undo (`Ctrl+Z`) works within the block being edited, not across blocks. It starts over
@@ -97,7 +97,7 @@ make a line break).
 - `ui/app.slint`: the UI. The document is a `ListView`, so only the blocks in view exist as
   UI elements, and memory use doesn't grow with the length of the file. The block being
   edited can scroll out of view: keys keep working, and typing brings it back.
-- `assets/`: the app icon (`mdedit.svg` is the source of the `.png` and `.ico`).
+- `assets/`: the app icon (`linter.svg` is the source of the `.png` and `.ico`).
 - `packaging/windows/`: Windows resources and the installer script.
 
 ## Tests
@@ -122,11 +122,11 @@ packaging/windows/build-installer.sh
 
 This cross-compiles from Linux and writes two files to `target/windows/`:
 
-- `mdedit-<version>-setup.exe` installs to Program Files with a Start menu shortcut and
+- `linter-<version>-setup.exe` installs to Program Files with a Start menu shortcut and
   an uninstaller (listed under Settings → Apps). Optionally, it adds a desktop shortcut
-  and lists mdedit under *Open with* for `.md` files, without changing the default
+  and lists linter under *Open with* for `.md` files, without changing the default
   program.
-- `mdedit-<version>-windows-x64.zip` holds the same files, to run without installing.
+- `linter-<version>-windows-x64.zip` holds the same files, to run without installing.
 
 It needs the Rust target (`rustup target add x86_64-pc-windows-gnu`), MinGW-w64
 (`mingw64-gcc` on Fedora) and NSIS (`makensis`). The app runs on 64-bit Windows 10 or

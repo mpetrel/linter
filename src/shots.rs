@@ -275,7 +275,7 @@ fn perf_large_document() {
     wire(&app, &editor);
     let sample = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/sample.md")).unwrap();
     let big = sample.repeat(60);
-    let path = std::env::temp_dir().join("mdedit-perf.md");
+    let path = std::env::temp_dir().join("linter-perf.md");
     std::fs::write(&path, &big).unwrap();
     let t = Instant::now();
     editor.borrow_mut().load(path);
@@ -299,7 +299,7 @@ fn perf_large_document() {
 #[test]
 #[ignore]
 fn shots_review() {
-    let dir = std::env::temp_dir().join(format!("mdedit-review-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("linter-review-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
     slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
@@ -386,7 +386,7 @@ fn shots_review() {
 #[test]
 #[ignore]
 fn shots_large_document() {
-    let dir = std::env::temp_dir().join(format!("mdedit-large-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("linter-large-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
     slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();

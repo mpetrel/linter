@@ -1,7 +1,7 @@
-; NSIS script for the mdedit Windows installer.
+; NSIS script for the linter Windows installer.
 ; Built by packaging/windows/build-installer.sh, which defines:
 ;   VERSION  the version from Cargo.toml (e.g. 0.1.0)
-;   STAGE    a folder holding mdedit.exe, README.md and examples\
+;   STAGE    a folder holding linter.exe, README.md and examples\
 ;   OUTFILE  the installer to write
 ;   ICON     the .ico file for the installer and uninstaller
 
@@ -20,9 +20,9 @@ SetCompressor /SOLID lzma
 !insertmacro Require OUTFILE
 !insertmacro Require ICON
 
-!define APP "mdedit"
-!define EXE "mdedit.exe"
-!define PROGID "mdedit.md"
+!define APP "linter"
+!define EXE "linter.exe"
+!define PROGID "linter.md"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP}"
 !define APPPATH_KEY "Software\Microsoft\Windows\CurrentVersion\App Paths\${EXE}"
 
@@ -96,7 +96,7 @@ Section "${APP} (required)" SecApp
 
   CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\${EXE}" "" "$INSTDIR\${EXE}" 0 SW_SHOWNORMAL "" "Markdown editor"
 
-  ; Lets "mdedit" be started from the Run dialog.
+  ; Lets "linter" be started from the Run dialog.
   WriteRegStr HKLM "${APPPATH_KEY}" "" "$INSTDIR\${EXE}"
 
   WriteRegStr HKLM "Software\${APP}" "InstallDir" "$INSTDIR"
@@ -123,7 +123,7 @@ SectionEnd
   WriteRegStr HKLM "Software\Classes\Applications\${EXE}\SupportedTypes" "${ext}" ""
 !macroend
 
-; Adds mdedit to "Open with" for Markdown files. It doesn't take over the
+; Adds linter to "Open with" for Markdown files. It doesn't take over the
 ; default program; choose that in Windows' "Open with" dialog.
 Section "Add to $\"Open with$\" for Markdown files" SecOpenWith
   WriteRegStr HKLM "Software\Classes\${PROGID}" "" "Markdown document"

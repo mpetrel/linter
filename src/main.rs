@@ -399,7 +399,7 @@ impl Editor {
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.path.is_none() && self.doc.is_blank() => {
-                // `mdedit new.md`: start a new file at that path.
+                // `linter new.md`: start a new file at that path.
                 self.set_status(format!("New file: {}", path.display()), false);
                 String::new()
             }
@@ -565,7 +565,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.{}.mdedit-tmp", std::process::id()));
+    let tmp = dir.join(format!(".{name}.{}.linter-tmp", std::process::id()));
     let result = (|| {
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(data)?;
@@ -720,14 +720,14 @@ fn percent_decode(s: &str) -> String {
 // ----- platform setup ----------------------------------------------------------------
 
 /// winit can't receive dropped files on Wayland, so prefer XWayland when it
-/// is available. Set `MDEDIT_WAYLAND=1` to run as a native Wayland client.
+/// is available. Set `LINTER_WAYLAND=1` to run as a native Wayland client.
 fn select_backend() {
     #[cfg(all(unix, not(target_vendor = "apple")))]
     {
         use slint::winit_030::winit::event_loop::EventLoop;
         use slint::winit_030::winit::platform::x11::EventLoopBuilderExtX11;
         let var = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
-        if var("WAYLAND_DISPLAY") && var("DISPLAY") && !var("MDEDIT_WAYLAND") && !var("SLINT_BACKEND") {
+        if var("WAYLAND_DISPLAY") && var("DISPLAY") && !var("LINTER_WAYLAND") && !var("SLINT_BACKEND") {
             let mut builder = EventLoop::<slint::winit_030::SlintEvent>::with_user_event();
             builder.with_x11();
             if let Err(e) = slint::BackendSelector::new()
@@ -738,13 +738,13 @@ fn select_backend() {
                 // winit allows a single event loop per process, so retry as a
                 // native Wayland client in a fresh process image.
                 use std::os::unix::process::CommandExt;
-                eprintln!("mdedit: X11 unavailable ({e}); restarting as a Wayland client");
+                eprintln!("linter: X11 unavailable ({e}); restarting as a Wayland client");
                 if let Ok(exe) = std::env::current_exe() {
                     let err = std::process::Command::new(exe)
                         .args(std::env::args_os().skip(1))
-                        .env("MDEDIT_WAYLAND", "1")
+                        .env("LINTER_WAYLAND", "1")
                         .exec();
-                    eprintln!("mdedit: restart failed: {err}");
+                    eprintln!("linter: restart failed: {err}");
                 }
                 std::process::exit(1);
             }
@@ -864,8 +864,8 @@ fn wire_theme(app: &App, settings: Option<PathBuf>) {
     });
 }
 
-/// The directory name for per-user settings.
-const SETTINGS_DIR: &str = "linter";
+/// The directory for per-user settings: the program's name.
+const SETTINGS_DIR: &str = env!("CARGO_PKG_NAME");
 
 /// Per-user settings file: `key=value` lines.
 fn settings_path() -> Option<PathBuf> {
@@ -986,7 +986,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mdedit-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("linter-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

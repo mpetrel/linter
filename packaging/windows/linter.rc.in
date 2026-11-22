@@ -1,4 +1,4 @@
-// Windows resources for mdedit.exe: icon, version info and manifest.
+// Windows resources for linter.exe: icon, version info and manifest.
 // build.rs fills in the @...@ placeholders.
 #include <winver.h>
 
@@ -15,11 +15,11 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "FileDescription", "mdedit Markdown editor"
+            VALUE "FileDescription", "linter Markdown editor"
             VALUE "FileVersion", "@VERSION@"
-            VALUE "InternalName", "mdedit"
-            VALUE "OriginalFilename", "mdedit.exe"
-            VALUE "ProductName", "mdedit"
+            VALUE "InternalName", "linter"
+            VALUE "OriginalFilename", "linter.exe"
+            VALUE "ProductName", "linter"
             VALUE "ProductVersion", "@VERSION@"
         END
     END

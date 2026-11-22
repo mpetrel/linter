@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-compiles mdedit for 64-bit Windows and builds the installer and a
+# Cross-compiles linter for 64-bit Windows and builds the installer and a
 # portable zip in target/windows/.
 #
 # Needs: the Rust target (rustup target add x86_64-pc-windows-gnu), the
@@ -21,16 +21,16 @@ cargo build --release --target "$target"
 
 rm -rf "$stage"
 mkdir -p "$stage/examples"
-cp "target/$target/release/mdedit.exe" "$stage/"
-x86_64-w64-mingw32-strip "$stage/mdedit.exe"
+cp "target/$target/release/linter.exe" "$stage/"
+x86_64-w64-mingw32-strip "$stage/linter.exe"
 cp README.md "$stage/"
 cp examples/sample.md examples/sample.png "$stage/examples/"
 
-setup="$out/mdedit-$version-setup.exe"
-makensis -V2 -DVERSION="$version" -DSTAGE="$stage" -DOUTFILE="$setup" -DICON="$PWD/assets/mdedit.ico" \
+setup="$out/linter-$version-setup.exe"
+makensis -V2 -DVERSION="$version" -DSTAGE="$stage" -DOUTFILE="$setup" -DICON="$PWD/assets/linter.ico" \
     packaging/windows/installer.nsi
 
-portable="$out/mdedit-$version-windows-x64.zip"
+portable="$out/linter-$version-windows-x64.zip"
 rm -f "$portable"
 (cd "$stage" && zip -qr9 "$portable" .)
 

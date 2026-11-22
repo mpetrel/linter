@@ -11,10 +11,10 @@ fn main() {
     }
 }
 
-/// Embeds the icon, version info and manifest in mdedit.exe.
+/// Embeds the icon, version info and manifest in linter.exe.
 fn windows_resources() {
-    let template = "packaging/windows/mdedit.rc.in";
-    for f in [template, "packaging/windows/mdedit.manifest", "assets/mdedit.ico"] {
+    let template = "packaging/windows/linter.rc.in";
+    for f in [template, "packaging/windows/linter.manifest", "assets/linter.ico"] {
         println!("cargo:rerun-if-changed={f}");
     }
     let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -23,13 +23,13 @@ fn windows_resources() {
     let env = |name: &str| std::env::var(name).unwrap();
     let rc = std::fs::read_to_string(template)
         .unwrap()
-        .replace("@ICON@", &path("assets/mdedit.ico"))
-        .replace("@MANIFEST@", &path("packaging/windows/mdedit.manifest"))
+        .replace("@ICON@", &path("assets/linter.ico"))
+        .replace("@MANIFEST@", &path("packaging/windows/linter.manifest"))
         .replace("@MAJOR@", &env("CARGO_PKG_VERSION_MAJOR"))
         .replace("@MINOR@", &env("CARGO_PKG_VERSION_MINOR"))
         .replace("@PATCH@", &env("CARGO_PKG_VERSION_PATCH"))
         .replace("@VERSION@", &env("CARGO_PKG_VERSION"));
-    let out = Path::new(&env("OUT_DIR")).join("mdedit.rc");
+    let out = Path::new(&env("OUT_DIR")).join("linter.rc");
     std::fs::write(&out, rc).unwrap();
     embed_resource::compile(&out, embed_resource::NONE).manifest_required().expect("Windows resources");
 }

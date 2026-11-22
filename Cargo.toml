@@ -1,5 +1,5 @@
 [package]
-name = "mdedit"
+name = "linter"
 version = "0.1.0"
 edition = "2024"
 description = "A small Typora-like live-preview Markdown editor built with Rust and Slint"
