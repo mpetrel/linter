@@ -1,0 +1,964 @@
+// A Typora-style live preview Markdown editor.
+//
+// The document is a column of blocks. Each block is shown rendered; clicking
+// one (or moving into it with the arrow keys) swaps it for its raw Markdown
+// in place, so `## Title` can become `### Title` by typing another `#`.
+
+import { ScrollView, Palette } from "std-widgets.slint";
+
+export enum BlockKind { empty, paragraph, heading, code, quote, list, rule, table, image, raw }
+
+export struct Line {
+    indent: int,
+    marker: string,
+    task: int,          // 0: none, 1: open, 2: done
+    text: styled-text,
+    code: string,
+    is-code: bool,
+}
+
+export struct Cell {
+    text: styled-text,
+    align: int,         // 0: left, 1: center, 2: right
+}
+
+export struct Row {
+    cells: [Cell],
+    header: bool,
+}
+
+export struct Block {
+    kind: BlockKind,
+    level: int,
+    source: string,
+    lines: [Line],
+    code: string,
+    lang: string,
+    rows: [Row],
+    col-weights: [float],
+    image: image,
+    has-image: bool,
+    caption: string,
+}
+
+// action: 0 = let the text field handle the key, 1 = handled, 2 = replace text
+export struct EditResult {
+    action: int,
+    text: string,
+    anchor: int,
+    cursor: int,
+}
+
+// Colours for the light and dark themes. Switch with App.apply-theme(), which
+// also switches the std widgets (the scroll bar) to match.
+export global Theme {
+    in-out property <bool> dark;
+    out property <color> page: dark ? #0d1117 : #ffffff;
+    out property <color> ink: dark ? #e6edf3 : #1f2328;
+    out property <color> soft: dark ? #9198a1 : #59636e;
+    out property <color> muted: dark ? #6e7681 : #8c959f;
+    out property <color> accent: dark ? #4493f8 : #0969da;
+    // Filled accent behind white text: checked boxes, badges, the default button.
+    out property <color> accent-fill: dark ? #1f6feb : #0969da;
+    out property <color> accent-pressed: dark ? #1158c7 : #0758b8;
+    out property <color> on-accent: #ffffff;
+    out property <color> rule: dark ? #3d444d : #d1d9e0;
+    out property <color> code-bg: dark ? #151b23 : #f6f8fa;
+    out property <color> edit-bg: dark ? #121a25 : #f3f6fa;
+    out property <color> chrome: dark ? #151b23 : #f6f8fa;
+    out property <color> quote-bar: dark ? #3d444d : #d1d9e0;
+    out property <color> row-alt: dark ? #10151c : #fafbfc;
+    out property <color> selection: dark ? #264f78 : #b6d7ff;
+    // Neutral fill on the page: block type badge, hovered dialog button.
+    out property <color> subtle: dark ? #262c36 : #eef1f4;
+    out property <color> hover: dark ? #262c36 : #e8ecf0;
+    out property <color> pressed: dark ? #2f3742 : #dde3ea;
+    out property <color> danger: dark ? #f85149 : #cf222e;
+    out property <color> scrim: dark ? #010409b3 : #1f232866;
+    out property <color> shadow: dark ? #00000099 : #00000040;
+    out property <length> body: 16px;
+    out property <length> mono-size: 14px;
+    in-out property <string> mono: "Noto Sans Mono";
+    out property <length> column: 820px;
+
+    public pure function heading-size(level: int) -> length {
+        level == 1 ? 30px : level == 2 ? 25px : level == 3 ? 21px : level == 4 ? 18px : level == 5 ? 16px : 15px
+    }
+}
+
+component FlowLines inherits VerticalLayout {
+    in property <[Line]> lines;
+    in property <color> color: Theme.ink;
+    spacing: 6px;
+
+    for line in root.lines: HorizontalLayout {
+        padding-left: line.indent * 26px;
+        spacing: 8px;
+
+        if line.marker != "" && line.task == 0: Text {
+            text: line.marker;
+            color: Theme.soft;
+            font-size: Theme.body;
+            min-width: 18px;
+            horizontal-alignment: right;
+            vertical-alignment: top;
+        }
+        if line.task != 0: VerticalLayout {
+            alignment: start;
+            padding-top: 3px;
+            Rectangle {
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                border-width: line.task == 2 ? 0px : 1.5px;
+                border-color: Theme.muted;
+                background: line.task == 2 ? Theme.accent-fill : Theme.page;
+                if line.task == 2: Text {
+                    text: "✓";
+                    color: Theme.on-accent;
+                    font-size: 12px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        if !line.is-code: StyledText {
+            text: line.text;
+            default-color: root.color;
+            default-font-size: Theme.body;
+            link-color: Theme.accent;
+            horizontal-stretch: 1;
+        }
+        if line.is-code: Rectangle {
+            horizontal-stretch: 1;
+            background: Theme.code-bg;
+            border-radius: 4px;
+            HorizontalLayout {
+                padding: 8px;
+                Text {
+                    text: line.code;
+                    font-family: Theme.mono;
+                    font-size: Theme.mono-size;
+                    color: Theme.ink;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}
+
+component CodeBox inherits Rectangle {
+    in property <string> code;
+    in property <string> lang;
+    in property <bool> raw;
+    background: Theme.code-bg;
+    border-radius: 6px;
+    border-width: root.raw ? 1px : 0px;
+    border-color: Theme.rule;
+
+    VerticalLayout {
+        padding: 12px;
+        padding-left: 16px;
+        padding-right: 16px;
+        Text {
+            text: root.code == "" ? " " : root.code;
+            font-family: Theme.mono;
+            font-size: Theme.mono-size;
+            color: root.raw ? Theme.soft : Theme.ink;
+            wrap: word-wrap;
+        }
+    }
+    if root.lang != "": Text {
+        x: parent.width - self.width - 10px;
+        y: 5px;
+        text: root.lang;
+        font-size: 11px;
+        color: Theme.muted;
+    }
+}
+
+component TableView inherits Rectangle {
+    in property <[Row]> rows;
+    in property <[float]> weights;
+    border-width: 1px;
+    border-color: Theme.rule;
+    border-radius: 6px;
+    clip: true;
+
+    VerticalLayout {
+        for row[r] in root.rows: Rectangle {
+            background: row.header ? Theme.code-bg : Math.mod(r, 2) == 0 ? Theme.page : Theme.row-alt;
+            HorizontalLayout {
+                for cell[c] in row.cells: Rectangle {
+                    width: root.width * root.weights[c];
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        padding-top: 7px;
+                        padding-bottom: 7px;
+                        StyledText {
+                            text: cell.text;
+                            default-font-size: Theme.body - 1px;
+                            default-color: Theme.ink;
+                            link-color: Theme.accent;
+                            horizontal-alignment: cell.align == 1 ? TextHorizontalAlignment.center : cell.align == 2 ? TextHorizontalAlignment.right : TextHorizontalAlignment.left;
+                        }
+                    }
+                    Rectangle {
+                        x: parent.width - 1px;
+                        width: 1px;
+                        background: Theme.rule;
+                        visible: c < row.cells.length - 1;
+                    }
+                }
+            }
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.rule;
+                visible: r < root.rows.length - 1;
+            }
+        }
+    }
+}
+
+component BlockView {
+    in property <Block> data;
+    in property <int> index;
+    in property <bool> editing;
+    in property <int> edit-seq;
+    in property <int> cursor-request: -1;
+    in property <bool> placeholder;
+
+    // cursor: -2 keep the cursor where the click put it, 0 start, -1 end
+    callback request-edit(index: int, cursor: int);
+    callback edited(index: int, text: string);
+    callback key-action(index: int, command: string, text: string, cursor: int, anchor: int) -> EditResult;
+    callback release-focus();
+    callback reveal(y: length, height: length);
+
+    property <bool> mono: data.kind == BlockKind.code || data.kind == BlockKind.raw || data.kind == BlockKind.table;
+    property <length> font-size: data.kind == BlockKind.heading ? Theme.heading-size(data.level) : root.mono ? Theme.mono-size : Theme.body;
+    property <length> pad-top: data.kind == BlockKind.heading ? (data.level <= 2 ? 18px : 12px) : 6px;
+    property <length> pad-bottom: data.kind == BlockKind.heading && data.level <= 2 ? 8px : 6px;
+    property <length> line-h: max(root.font-size * 1.2, input.font-metrics.ascent + abs(input.font-metrics.descent));
+    property <length> caret-y;
+    property <string> src: data.source;
+    // Changes whenever the editor (re)starts editing this block.
+    property <int> sync: root.editing ? root.edit-seq : -1;
+
+    height: root.editing ? max(input.preferred-height, root.line-h) + root.pad-top + root.pad-bottom : view.preferred-height;
+
+    init => {
+        input.text = root.data.source;
+        if root.editing {
+            root.sync-input();
+        }
+    }
+    changed sync => {
+        root.sync-input();
+    }
+    changed src => {
+        if !root.editing && input.text != root.src {
+            input.text = root.src;
+        }
+    }
+
+    function sync-input() {
+        if root.editing {
+            if input.text != root.data.source {
+                input.text = root.data.source;
+            }
+            if !input.has-focus {
+                input.focus();
+            }
+            if root.cursor-request >= 0 {
+                // This always fires cursor-position-changed with the real caret
+                // position, which updates caret-y and scrolls it into view.
+                input.set-selection-offsets(root.cursor-request, root.cursor-request);
+            }
+        } else {
+            if input.has-focus {
+                input.clear-focus();
+                root.release-focus();
+            }
+            if input.text != root.data.source {
+                input.text = root.data.source;
+            }
+        }
+    }
+
+    function act(command: string) -> EventResult {
+        let r = root.key-action(root.index, command, input.text, input.cursor-position-byte-offset, input.anchor-position-byte-offset);
+        if r.action == 0 {
+            return EventResult.reject;
+        }
+        if r.action == 2 {
+            input.text = r.text;
+            input.set-selection-offsets(r.anchor, r.cursor);
+        }
+        return EventResult.accept;
+    }
+
+    pure function kind-label() -> string {
+        data.kind == BlockKind.heading ? "H\{data.level}" : data.kind == BlockKind.code ? "code" : data.kind == BlockKind.quote ? "quote" : data.kind == BlockKind.list ? "list" : data.kind == BlockKind.table ? "table" : data.kind == BlockKind.image ? "image" : data.kind == BlockKind.rule ? "rule" : data.kind == BlockKind.raw ? "raw" : "text"
+    }
+
+    // Edit-mode highlight, reaching into the margins so the text doesn't move.
+    Rectangle {
+        x: -14px;
+        width: parent.width + 28px;
+        border-radius: 6px;
+        background: root.editing ? Theme.edit-bg : transparent;
+        Rectangle {
+            x: 0;
+            y: 6px;
+            width: 3px;
+            height: parent.height - 12px;
+            border-radius: 1.5px;
+            background: root.editing ? Theme.accent : transparent;
+        }
+    }
+
+    area := TouchArea {
+        mouse-cursor: MouseCursor.text;
+        // Clicks in the padding around the text: start or end of the block.
+        clicked => {
+            root.request-edit(root.index, self.mouse-y < input.y ? 0 : -1);
+        }
+
+        view := VerticalLayout {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: self.preferred-height;
+            visible: !root.editing;
+            padding-top: root.pad-top;
+            padding-bottom: root.pad-bottom;
+
+            if data.kind == BlockKind.heading: VerticalLayout {
+                spacing: 8px;
+                StyledText {
+                    text: data.lines[0].text;
+                    default-font-size: Theme.heading-size(data.level);
+                    default-color: data.level == 6 ? Theme.soft : Theme.ink;
+                    link-color: Theme.accent;
+                }
+                if data.level <= 2: Rectangle {
+                    height: 1px;
+                    background: Theme.rule;
+                }
+            }
+            if data.kind == BlockKind.paragraph || data.kind == BlockKind.list: FlowLines {
+                lines: data.lines;
+            }
+            if data.kind == BlockKind.quote: HorizontalLayout {
+                spacing: 14px;
+                Rectangle {
+                    width: 4px;
+                    border-radius: 2px;
+                    background: Theme.quote-bar;
+                }
+                FlowLines {
+                    lines: data.lines;
+                    color: Theme.soft;
+                }
+            }
+            if data.kind == BlockKind.code || data.kind == BlockKind.raw: CodeBox {
+                code: data.code;
+                lang: data.lang;
+                raw: data.kind == BlockKind.raw;
+            }
+            if data.kind == BlockKind.rule: VerticalLayout {
+                padding-top: 10px;
+                padding-bottom: 10px;
+                Rectangle {
+                    height: 2px;
+                    background: Theme.rule;
+                }
+            }
+            if data.kind == BlockKind.table: TableView {
+                rows: data.rows;
+                weights: data.col-weights;
+            }
+            if data.kind == BlockKind.image && data.has-image: HorizontalLayout {
+                alignment: start;
+                Image {
+                    source: data.image;
+                    width: min(root.width, data.image.width * 1px);
+                    height: self.width * data.image.height / max(1, data.image.width);
+                }
+            }
+            if data.kind == BlockKind.image && !data.has-image: Rectangle {
+                border-width: 1px;
+                border-color: Theme.rule;
+                border-radius: 6px;
+                background: Theme.code-bg;
+                HorizontalLayout {
+                    padding: 14px;
+                    Text {
+                        text: "🖼  " + data.caption;
+                        color: Theme.soft;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+            if data.kind == BlockKind.empty: Text {
+                text: root.placeholder ? "Click here and start writing Markdown…" : "";
+                color: Theme.muted;
+                font-size: Theme.body;
+                min-height: Theme.body * 1.4;
+            }
+        }
+
+        input := TextInput {
+            x: 0;
+            y: root.pad-top;
+            width: parent.width;
+            height: root.editing ? max(self.preferred-height, root.line-h) : max(0px, parent.height - root.pad-top - root.pad-bottom);
+            visible: root.editing || area.has-hover;
+            single-line: false;
+            wrap: word-wrap;
+            vertical-alignment: top;
+            font-size: root.font-size;
+            font-weight: data.kind == BlockKind.heading ? 700 : 400;
+            font-family: root.mono ? Theme.mono : "";
+            // Lists and quotes render one row per line with 6px spacing; match it
+            // so a click lands on the same line in the raw text.
+            line-height-factor: data.kind == BlockKind.list || data.kind == BlockKind.quote ? (root.line-h + 6px) / root.line-h : 1;
+            color: !root.editing ? transparent : data.kind == BlockKind.heading && data.level == 6 ? Theme.soft : Theme.ink;
+            selection-background-color: Theme.selection;
+            selection-foreground-color: Theme.ink;
+
+            edited => {
+                root.edited(root.index, self.text);
+            }
+            cursor-position-changed(pos) => {
+                root.caret-y = pos.y;
+                if root.editing {
+                    root.reveal(self.y + pos.y, root.line-h);
+                }
+            }
+            changed has-focus => {
+                if self.has-focus && !root.editing {
+                    root.request-edit(root.index, -2);
+                }
+            }
+            key-pressed(e) => {
+                if e.text == Key.Escape {
+                    return root.act("escape");
+                }
+                if e.text == Key.Return {
+                    if e.modifiers.shift {
+                        return EventResult.reject;
+                    }
+                    return root.act(e.modifiers.control ? "ctrl-enter" : "enter");
+                }
+                if e.text == Key.Backtab || (e.text == Key.Tab && e.modifiers.shift) {
+                    return root.act("backtab");
+                }
+                if e.text == Key.Tab {
+                    return root.act("tab");
+                }
+                if e.text == Key.Backspace && !e.modifiers.control {
+                    return root.act("backspace");
+                }
+                if e.text == Key.Delete && !e.modifiers.control {
+                    return root.act("delete");
+                }
+                if e.text == Key.UpArrow && !e.modifiers.shift && root.caret-y < root.line-h * 0.5 {
+                    return root.act("up");
+                }
+                if e.text == Key.DownArrow && !e.modifiers.shift && root.caret-y + root.line-h * 1.5 > self.height {
+                    return root.act("down");
+                }
+                if e.modifiers.control && !e.modifiers.alt {
+                    if e.text == "=" || e.text == "+" {
+                        return root.act("promote");
+                    }
+                    if e.text == "-" || e.text == "_" {
+                        return root.act("demote");
+                    }
+                    if e.text == "0" || e.text == "1" || e.text == "2" || e.text == "3" || e.text == "4" || e.text == "5" || e.text == "6" {
+                        return root.act("h" + e.text);
+                    }
+                    if e.text == "b" || e.text == "B" {
+                        return root.act("bold");
+                    }
+                    if e.text == "i" || e.text == "I" {
+                        return root.act("italic");
+                    }
+                }
+                return EventResult.reject;
+            }
+        }
+
+        if root.editing && input.text == "": Text {
+            x: input.x;
+            y: input.y;
+            text: "Type Markdown…   # heading   - list   > quote   ``` code";
+            color: Theme.muted;
+            font-size: Theme.body;
+        }
+    }
+
+    // Block type badge in the left margin.
+    if root.editing || area.has-hover: Rectangle {
+        x: -62px;
+        y: root.pad-top + max(0px, (min(root.line-h, root.height) - 18px) / 2);
+        width: 40px;
+        height: 18px;
+        border-radius: 4px;
+        background: root.editing ? Theme.accent-fill : Theme.subtle;
+        Text {
+            text: root.kind-label();
+            font-size: 11px;
+            color: root.editing ? Theme.on-accent : Theme.soft;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component ToolButton inherits Rectangle {
+    in property <string> text;
+    in property <string> shortcut;
+    callback clicked;
+    height: 28px;
+    min-width: label.preferred-width + 22px;
+    border-radius: 6px;
+    background: ta.pressed ? Theme.pressed : ta.has-hover ? Theme.hover : transparent;
+
+    label := Text {
+        text: root.text;
+        color: Theme.ink;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component DialogButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary;
+    callback clicked;
+    height: 32px;
+    min-width: label.preferred-width + 28px;
+    border-radius: 6px;
+    background: root.primary ? (ta.pressed ? Theme.accent-pressed : Theme.accent-fill) : (ta.pressed ? Theme.pressed : ta.has-hover ? Theme.subtle : Theme.page);
+    border-width: root.primary ? 0px : 1px;
+    border-color: Theme.rule;
+
+    label := Text {
+        text: root.text;
+        color: root.primary ? Theme.on-accent : Theme.ink;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component MenuEntry inherits Rectangle {
+    in property <string> text;
+    in property <bool> checked;
+    callback clicked;
+    height: 30px;
+    border-radius: 4px;
+    background: ta.has-hover ? Theme.hover : transparent;
+
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 14px;
+        spacing: 4px;
+        Text {
+            width: 20px;
+            text: root.checked ? "✓" : "";
+            color: Theme.accent;
+            font-size: 13px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.text;
+            color: Theme.ink;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Toolbar button that opens a menu to pick the light or dark theme.
+component ThemeMenu inherits Rectangle {
+    callback choose(dark: bool);
+    height: 28px;
+    width: label.preferred-width + 38px;
+    border-radius: 6px;
+    background: ta.pressed ? Theme.pressed : ta.has-hover ? Theme.hover : transparent;
+
+    label := Text {
+        x: 11px;
+        height: parent.height;
+        text: "Theme";
+        color: Theme.ink;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+    Path {
+        x: parent.width - 20px;
+        y: (parent.height - self.height) / 2 + 1px;
+        width: 9px;
+        height: 5px;
+        viewbox-width: 9;
+        viewbox-height: 5;
+        commands: "M 0.75 0.75 L 4.5 4.25 L 8.25 0.75";
+        stroke: Theme.soft;
+        stroke-width: 1.5px;
+    }
+    ta := TouchArea {
+        clicked => {
+            popup.show();
+        }
+    }
+
+    // Transparent margin around the card leaves room for its shadow.
+    popup := PopupWindow {
+        x: parent.width - self.width + 8px;
+        y: parent.height - 4px;
+        width: 176px;
+        height: menu.preferred-height + 16px;
+        Rectangle {
+            x: 8px;
+            y: 8px;
+            width: parent.width - 16px;
+            height: parent.height - 16px;
+            background: Theme.page;
+            border-width: 1px;
+            border-color: Theme.rule;
+            border-radius: 8px;
+            drop-shadow-blur: 12px;
+            drop-shadow-offset-y: 2px;
+            drop-shadow-color: Theme.shadow;
+            menu := VerticalLayout {
+                padding: 4px;
+                MenuEntry {
+                    text: "Light";
+                    checked: !Theme.dark;
+                    clicked => {
+                        root.choose(false);
+                    }
+                }
+                MenuEntry {
+                    text: "Dark";
+                    checked: Theme.dark;
+                    clicked => {
+                        root.choose(true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component App inherits Window {
+    title: (root.modified ? "● " : "") + root.file-name + " — Markdown Editor";
+    icon: @image-url("../assets/mdedit.png");
+    preferred-width: 1040px;
+    preferred-height: 780px;
+    min-width: 520px;
+    min-height: 360px;
+    background: Theme.page;
+
+    in property <[Block]> blocks;
+    in property <int> editing-index: -1;
+    in property <int> edit-seq;
+    in property <int> cursor-request: -1;
+    in property <string> file-name: "Untitled";
+    in property <string> file-path;
+    in property <bool> modified;
+    in property <string> status;
+    in property <bool> status-error;
+    in property <int> words;
+    in property <int> chars;
+    in property <bool> doc-blank;
+    in property <bool> confirm-open;
+    in property <string> confirm-text;
+    in property <bool> drop-hover;
+
+    callback edited(index: int, text: string);
+    callback key-action(index: int, command: string, text: string, cursor: int, anchor: int) -> EditResult;
+    callback request-edit(index: int, cursor: int);
+    callback click-below();
+    callback open-file();
+    callback save-file();
+    callback save-file-as();
+    callback confirm-choice(choice: int);
+    callback focus-root();
+    // Click on empty space beside or above the document.
+    callback click-blank();
+    callback choose-theme(dark: bool);
+
+    public function apply-theme(dark: bool) {
+        Theme.dark = dark;
+        Palette.color-scheme = dark ? ColorScheme.dark : ColorScheme.light;
+    }
+
+    focus-root => {
+        fs.focus();
+    }
+
+    property <BlockKind> editing-kind: root.editing-index >= 0 ? root.blocks[root.editing-index].kind : BlockKind.empty;
+    property <int> editing-level: root.editing-index >= 0 ? root.blocks[root.editing-index].level : 0;
+    property <string> hint: root.editing-index < 0 ? "Click a block to edit its Markdown" : root.editing-kind == BlockKind.heading ? "Heading \{root.editing-level}  ·  edit the #'s, or Ctrl+= / Ctrl+- to change level  ·  Ctrl+0 paragraph  ·  Esc done" : root.editing-kind == BlockKind.list ? "List  ·  Enter next item  ·  Tab / Shift+Tab indent  ·  Enter on empty item ends the list" : root.editing-kind == BlockKind.quote ? "Quote  ·  Enter continues  ·  Enter on an empty line ends the quote" : root.editing-kind == BlockKind.code ? "Code  ·  Enter new line  ·  Ctrl+Enter or ↓ at the end leaves the block" : root.editing-kind == BlockKind.table ? "Table  ·  edit the rows as text  ·  Ctrl+Enter adds a paragraph below" : "Text  ·  Ctrl+1…6 heading  ·  Ctrl+B / Ctrl+I  ·  Shift+Enter line break  ·  Esc done";
+
+    function scroll-into-view(y: length, h: length) {
+        let top = col.y + y - 24px;
+        let bottom = col.y + y + h + 24px;
+        let max-scroll = max(0px, sv.content-height - sv.visible-height);
+        if top < -sv.content-y {
+            sv.content-y = -max(0px, top);
+        } else if bottom > -sv.content-y + sv.visible-height {
+            sv.content-y = -min(max-scroll, bottom - sv.visible-height);
+        }
+    }
+
+    fs := FocusScope {
+        capture-key-pressed(e) => {
+            if e.modifiers.control && !e.modifiers.alt {
+                if e.text == "s" || e.text == "S" {
+                    if e.modifiers.shift {
+                        root.save-file-as();
+                    } else {
+                        root.save-file();
+                    }
+                    return EventResult.accept;
+                }
+                if e.text == "o" || e.text == "O" {
+                    root.open-file();
+                    return EventResult.accept;
+                }
+            }
+            return EventResult.reject;
+        }
+
+        VerticalLayout {
+            // Toolbar
+            Rectangle {
+                height: 44px;
+                background: Theme.chrome;
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 14px;
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    spacing: 4px;
+                    ToolButton {
+                        text: "Open…";
+                        clicked => {
+                            root.open-file();
+                        }
+                    }
+                    ToolButton {
+                        text: "Save";
+                        clicked => {
+                            root.save-file();
+                        }
+                    }
+                    ToolButton {
+                        text: "Save As…";
+                        clicked => {
+                            root.save-file-as();
+                        }
+                    }
+                    Rectangle {
+                        width: 12px;
+                    }
+                    Text {
+                        text: root.file-path == "" ? "Untitled — drop a .md file here or press Ctrl+O" : root.file-path;
+                        color: Theme.soft;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    ThemeMenu {
+                        choose(dark) => {
+                            root.choose-theme(dark);
+                        }
+                    }
+                }
+                Rectangle {
+                    y: parent.height - 1px;
+                    height: 1px;
+                    background: Theme.rule;
+                }
+            }
+
+            sv := ScrollView {
+                mouse-drag-pan-enabled: false;
+                content-width: self.visible-width;
+                content-height: max(self.visible-height, col.preferred-height + col.y + 160px);
+
+                TouchArea {
+                    width: sv.content-width;
+                    height: sv.content-height;
+                    mouse-cursor: MouseCursor.text;
+                    clicked => {
+                        if self.mouse-y > col.y + col.height {
+                            root.click-below();
+                        } else {
+                            root.click-blank();
+                        }
+                    }
+                }
+
+                col := VerticalLayout {
+                    x: max(80px, (sv.visible-width - Theme.column) / 2);
+                    y: 36px;
+                    width: min(Theme.column, sv.visible-width - 160px);
+                    height: self.preferred-height;
+
+                    for block[i] in root.blocks: BlockView {
+                        data: block;
+                        index: i;
+                        editing: i == root.editing-index;
+                        edit-seq: root.edit-seq;
+                        cursor-request: root.cursor-request;
+                        placeholder: root.doc-blank && root.blocks.length == 1;
+                        request-edit(index, cursor) => {
+                            root.request-edit(index, cursor);
+                        }
+                        edited(index, text) => {
+                            root.edited(index, text);
+                        }
+                        key-action(index, command, text, cursor, anchor) => {
+                            return root.key-action(index, command, text, cursor, anchor);
+                        }
+                        release-focus => {
+                            fs.focus();
+                        }
+                        reveal(y, h) => {
+                            root.scroll-into-view(self.y + y, h);
+                        }
+                    }
+                }
+            }
+
+            // Status bar
+            Rectangle {
+                height: 26px;
+                background: Theme.chrome;
+                Rectangle {
+                    y: 0;
+                    height: 1px;
+                    background: Theme.rule;
+                }
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    spacing: 16px;
+                    Text {
+                        text: root.status != "" ? root.status : root.hint;
+                        color: root.status-error ? Theme.danger : Theme.soft;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: "\{root.words} words  ·  \{root.chars} characters";
+                        color: Theme.muted;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        if root.drop-hover: Rectangle {
+            background: Theme.accent.with-alpha(0.08);
+            Rectangle {
+                x: 16px;
+                y: 16px;
+                width: parent.width - 32px;
+                height: parent.height - 32px;
+                border-width: 2px;
+                border-color: Theme.accent;
+                border-radius: 12px;
+                Text {
+                    text: "Drop to open";
+                    font-size: 22px;
+                    color: Theme.accent;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        if root.confirm-open: Rectangle {
+            background: Theme.scrim;
+            TouchArea { }
+            Rectangle {
+                width: min(440px, parent.width - 40px);
+                height: dialog.preferred-height;
+                background: Theme.page;
+                border-radius: 10px;
+                drop-shadow-blur: 24px;
+                drop-shadow-color: Theme.shadow;
+                dialog := VerticalLayout {
+                    padding: 22px;
+                    spacing: 18px;
+                    Text {
+                        text: "Unsaved changes";
+                        font-size: 17px;
+                        font-weight: 700;
+                        color: Theme.ink;
+                    }
+                    Text {
+                        text: root.confirm-text;
+                        wrap: word-wrap;
+                        color: Theme.soft;
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 8px;
+                        DialogButton {
+                            text: "Cancel";
+                            clicked => {
+                                root.confirm-choice(2);
+                            }
+                        }
+                        DialogButton {
+                            text: "Don't Save";
+                            clicked => {
+                                root.confirm-choice(1);
+                            }
+                        }
+                        DialogButton {
+                            text: "Save";
+                            primary: true;
+                            clicked => {
+                                root.confirm-choice(0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
