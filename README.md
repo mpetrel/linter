@@ -12,8 +12,8 @@ document rendered. When nothing is being edited, a click below the last block co
 writing at the end.
 
 The *Theme* menu at the right of the toolbar switches between the light and dark theme.
-The choice is remembered in `~/.config/mdedit/settings` (`%APPDATA%\mdedit\settings` on
-Windows, `~/Library/Application Support/mdedit/settings` on macOS).
+The choice is remembered in `~/.config/linter/settings` (`%APPDATA%\linter\settings` on
+Windows, `~/Library/Application Support/linter/settings` on macOS).
 
 ```sh
 cargo run --release -- path/to/file.md     # or start without a file

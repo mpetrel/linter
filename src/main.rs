@@ -864,6 +864,9 @@ fn wire_theme(app: &App, settings: Option<PathBuf>) {
     });
 }
 
+/// The directory name for per-user settings.
+const SETTINGS_DIR: &str = "linter";
+
 /// Per-user settings file: `key=value` lines.
 fn settings_path() -> Option<PathBuf> {
     let env_dir = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
@@ -874,7 +877,7 @@ fn settings_path() -> Option<PathBuf> {
     } else {
         env_dir("XDG_CONFIG_HOME").or_else(|| env_dir("HOME").map(|h| h.join(".config")))
     };
-    base.map(|b| b.join("mdedit").join("settings"))
+    base.map(|b| b.join(SETTINGS_DIR).join("settings"))
 }
 
 fn read_setting(path: &Path, key: &str) -> Option<String> {
@@ -1038,6 +1041,13 @@ mod tests {
         assert_eq!(read_setting(&file, "theme").as_deref(), Some("light"));
         assert_eq!(read_setting(&file, "other").as_deref(), Some("1"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn settings_live_in_the_linter_directory() {
+        if let Some(path) = settings_path() {
+            assert!(path.ends_with(Path::new("linter").join("settings")), "{}", path.display());
+        }
     }
 
     #[test]
