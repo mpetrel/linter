@@ -30,13 +30,24 @@ struct Harness {
 }
 
 impl Harness {
+    /// Runs timers and draws frames, as the event loop would. Drawing matters:
+    /// the document list creates the rows in view while it lays out.
     fn settle(&self) {
+        let mut buf = vec![Rgb8Pixel::default(); (W * H) as usize];
         for _ in 0..4 {
             slint::platform::update_timers_and_animations();
             std::thread::sleep(Duration::from_millis(5));
             self.window.request_redraw();
-            self.window.draw_if_needed(|_| {});
+            self.window.draw_if_needed(|r| {
+                r.render(&mut buf, W as usize);
+            });
         }
+    }
+
+    fn scroll(&self, delta_y: f32) {
+        let position = LogicalPosition::new(300.0, 400.0);
+        self.window.dispatch_event(WindowEvent::PointerScrolled { position, delta_x: 0.0, delta_y });
+        self.settle();
     }
 
     fn snap(&self, name: &str) {
@@ -366,6 +377,129 @@ fn shots_review() {
 
     std::fs::remove_dir_all(&dir).unwrap();
     println!("review checks passed");
+}
+
+/// The document list only creates the rows in view. Editing has to keep
+/// working across that: moving to blocks that have no row yet, scrolling the
+/// block being edited out of view and typing, saving or leaving edit mode
+/// meanwhile, and scrolling it back. No screenshots.
+#[test]
+#[ignore]
+fn shots_large_document() {
+    let dir = std::env::temp_dir().join(format!("mdedit-large-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    let app = App::new().unwrap();
+    window.set_size(PhysicalSize::new(W, H));
+    let editor = Rc::new(RefCell::new(Editor::new(&app)));
+    wire(&app, &editor);
+    app.show().unwrap();
+    let h = Harness { window, dir: dir.clone() };
+    let src = |i: usize| editor.borrow().doc.blocks[i].src.clone();
+    let editing = || editor.borrow().editing;
+
+    // A table taller than 32767 pixels: drawing it with a rounded clip made the
+    // software renderer panic.
+    let mut table = String::from("| a | b |\n| - | - |\n");
+    for i in 0..1200 {
+        table.push_str(&format!("| {i} | x |\n"));
+    }
+    let file = dir.join("table.md");
+    std::fs::write(&file, format!("{table}\nafter\n")).unwrap();
+    editor.borrow_mut().load(file);
+    h.settle();
+    h.scroll(-30000.0);
+    h.scroll(-1_000_000.0);
+
+    let text: String = (0..400).map(|i| format!("Paragraph {i}.\n\n")).collect();
+    let file = dir.join("large.md");
+    std::fs::write(&file, &text).unwrap();
+    editor.borrow_mut().load(file.clone());
+    h.settle();
+
+    // A key typed right after moving down, before the list has drawn the block
+    // moved to, goes where the move put the caret: at the start.
+    editor.borrow_mut().request_edit(Some(0), Some(Cursor::End));
+    h.settle();
+    let press = |text: SharedString| {
+        h.window.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+        h.window.dispatch_event(WindowEvent::KeyReleased { text });
+    };
+    for i in 1..=40 {
+        press(Key::DownArrow.into());
+        press("K".into());
+        h.settle();
+        assert_eq!(editing(), Some(i));
+        assert_eq!(src(i), format!("KParagraph {i}."));
+        h.key(Key::Backspace);
+        assert_eq!(src(i), format!("Paragraph {i}."));
+    }
+    // The same when the block has no row at all yet: the key is typed in by
+    // Rust, then the block comes into view with its caret after the key.
+    editor.borrow_mut().request_edit(Some(300), Some(Cursor::At(0)));
+    slint::platform::update_timers_and_animations(); // change handlers, but no layout yet
+    press("K".into());
+    h.settle();
+    assert_eq!(src(300), "KParagraph 300.");
+    h.type_text("L");
+    assert_eq!(src(300), "KLParagraph 300.", "the text field has the focus, after the K");
+    h.key(Key::Escape);
+
+    // Down from the first block walks into blocks far below the first screen.
+    editor.borrow_mut().request_edit(Some(0), Some(Cursor::End));
+    h.settle();
+    for _ in 0..80 {
+        h.key(Key::DownArrow);
+    }
+    assert_eq!(editing(), Some(80));
+    h.type_text("X");
+    assert_eq!(src(80), "XParagraph 80.", "the text field of the block moved to has the focus");
+    for _ in 0..30 {
+        h.key(Key::UpArrow);
+    }
+    assert_eq!(editing(), Some(50));
+    h.type_text("Y");
+    assert_eq!(src(50), "Paragraph 50.Y");
+
+    // Scrolled far away, the block has no text field. Typing goes in at its
+    // caret and brings it back; then its text field has the focus again.
+    h.scroll(-20000.0);
+    h.type_text("Z");
+    assert_eq!(src(50), "Paragraph 50.YZ");
+    h.type_text("W");
+    assert_eq!(src(50), "Paragraph 50.YZW", "typing continues in the text field");
+
+    // Ctrl+S and Esc work while the block is out of view.
+    h.scroll(-20000.0);
+    h.ctrl("s");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), editor.borrow().doc.to_text());
+    assert!(!editor.borrow().modified);
+    assert_eq!(editing(), Some(50), "saving keeps editing");
+    h.key(Key::Escape);
+    assert_eq!(editing(), None);
+
+    // Scrolling away and back resumes at the same caret.
+    editor.borrow_mut().request_edit(Some(10), Some(Cursor::End));
+    h.settle();
+    h.type_text("Q");
+    h.key(Key::LeftArrow);
+    h.scroll(-20000.0);
+    h.scroll(1_000_000.0);
+    h.type_text("R");
+    assert_eq!(src(10), "Paragraph 10.RQ");
+    h.key(Key::Escape);
+
+    // A click on the page below a short document continues writing at its end.
+    let file = dir.join("short.md");
+    std::fs::write(&file, "one\n\ntwo\n").unwrap();
+    editor.borrow_mut().load(file);
+    h.settle();
+    h.click(500.0, H as f32 - 80.0);
+    assert_eq!(editing(), Some(1), "a click below a short document edits its last block");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    println!("large document checks passed");
 }
 
 /// The theme menu, the dark theme, and leaving edit mode by clicking blank

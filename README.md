@@ -81,7 +81,8 @@ make a line break).
   or Pinyin) can drop or delay keys, such as repeated spaces. `MDEDIT_WAYLAND=1` uses
   the Wayland input-method support instead.
 - Links aren't opened on click (a click edits the block). Remote images aren't downloaded.
-- Undo (`Ctrl+Z`) works within the block being edited, not across blocks.
+- Undo (`Ctrl+Z`) works within the block being edited, not across blocks. It starts over
+  when that block scrolls out of view and back.
 - Tables and code blocks are edited as plain text.
 
 ## Code layout
@@ -93,7 +94,9 @@ make a line break).
 - `src/ops.rs`: keyboard commands (Enter, merge, heading levels, list indent, …) as pure
   functions.
 - `src/main.rs`: Slint glue, files, drag and drop, unsaved-changes prompt.
-- `ui/app.slint`: the UI.
+- `ui/app.slint`: the UI. The document is a `ListView`, so only the blocks in view exist as
+  UI elements, and memory use doesn't grow with the length of the file. The block being
+  edited can scroll out of view: keys keep working, and typing brings it back.
 - `assets/`: the app icon (`mdedit.svg` is the source of the `.png` and `.ico`).
 - `packaging/windows/`: Windows resources and the installer script.
 
@@ -103,6 +106,7 @@ make a line break).
 cargo test                                      # unit tests
 SHOT_DIR=/tmp/shots cargo test shots::shots -- --exact --ignored   # headless UI run
 cargo test shots::shots_review -- --exact --ignored               # UI regression checks
+cargo test shots::shots_large_document -- --exact --ignored       # editing a long document
 SHOT_DIR=/tmp/shots cargo test shots::shots_theme -- --exact --ignored   # theme menu, dark theme
 ```
 

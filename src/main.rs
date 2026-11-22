@@ -35,6 +35,9 @@ struct Editor {
     /// Index of the block shown as raw Markdown.
     editing: Option<usize>,
     edit_seq: i32,
+    /// Where the caret was asked to go when editing started (`KEEP_CURSOR`:
+    /// where the click put it).
+    edit_cursor: i32,
     /// Source of the edited block when editing started.
     original: String,
     path: Option<PathBuf>,
@@ -42,6 +45,8 @@ struct Editor {
     saved_text: String,
     modified: bool,
     pending: Option<Pending>,
+    /// Words and characters in the document, kept up to date while typing.
+    counts: (usize, usize),
 }
 
 impl Editor {
@@ -57,10 +62,12 @@ impl Editor {
             model,
             editing: None,
             edit_seq: 0,
+            edit_cursor: KEEP_CURSOR,
             original: String::new(),
             path: None,
             modified: false,
             pending: None,
+            counts: (0, 0),
         };
         editor.rebuild();
         editor
@@ -134,8 +141,9 @@ impl Editor {
         }
     }
 
-    fn refresh_meta(&self) {
-        let (words, chars) = self.doc.word_count();
+    fn refresh_meta(&mut self) {
+        self.counts = self.doc.word_count();
+        let (words, chars) = self.counts;
         let name = self
             .path
             .as_deref()
@@ -154,6 +162,32 @@ impl Editor {
         });
     }
 
+    /// The part of `refresh_meta` that typing in a block can change.
+    fn refresh_typing(&self) {
+        let (words, chars) = self.counts;
+        let blank = self.doc.is_blank();
+        let modified = self.modified;
+        self.with_ui(|ui| {
+            ui.set_modified(modified);
+            ui.set_words(words as i32);
+            ui.set_chars(chars as i32);
+            ui.set_doc_blank(blank);
+        });
+    }
+
+    /// Replaces the text of block `i` as it's typed. Updates the counts from
+    /// this block alone, so a keystroke doesn't rescan the whole document.
+    fn set_block_text(&mut self, i: usize, text: String) {
+        let (old_words, old_chars) = doc::word_count(&self.doc.blocks[i].src);
+        let (new_words, new_chars) = doc::word_count(&text);
+        let (words, chars) = self.counts;
+        self.counts = (words.saturating_sub(old_words) + new_words, chars.saturating_sub(old_chars) + new_chars);
+        self.doc.blocks[i].src = text;
+        self.modified = true;
+        self.update_live(i);
+        self.refresh_typing();
+    }
+
     fn set_status(&self, text: impl Into<SharedString>, error: bool) {
         let text = text.into();
         self.with_ui(|ui| {
@@ -168,6 +202,7 @@ impl Editor {
         self.editing = target;
         self.original = target.map(|t| self.doc.blocks[t].src.clone()).unwrap_or_default();
         self.edit_seq += 1;
+        self.edit_cursor = cursor;
         let seq = self.edit_seq;
         self.with_ui(|ui| {
             ui.set_cursor_request(cursor);
@@ -243,15 +278,46 @@ impl Editor {
     }
 
     fn edited(&mut self, i: usize, text: &str) {
-        let Some(block) = self.doc.blocks.get_mut(i) else { return };
+        let Some(block) = self.doc.blocks.get(i) else { return };
         if block.src == text {
             return;
         }
-        block.src = text.to_owned();
-        self.modified = true;
-        self.update_live(i);
-        self.refresh_meta();
+        self.set_block_text(i, text.to_owned());
         self.set_status("", false);
+    }
+
+    /// A key pressed while the block being edited is scrolled out of view, so
+    /// that its text field is gone: text is typed at the saved caret, and any
+    /// key but a lone modifier brings the block back into view. Returns
+    /// whether the key was used.
+    fn key_away(&mut self, text: &str, command: bool) -> bool {
+        let Some(i) = self.editing.filter(|&i| i < self.doc.blocks.len()) else { return false };
+        if is_modifier_key(text) {
+            return false;
+        }
+        let Some(ui) = self.ui.upgrade() else { return false };
+        if !command && is_typed_text(text) {
+            let src = &self.doc.blocks[i].src;
+            let (caret, anchor) = if ui.get_caret_seq() == self.edit_seq {
+                (ui.get_saved_caret().max(0) as usize, ui.get_saved_anchor().max(0) as usize)
+            } else {
+                // The block hasn't had a text field in this session yet (it's
+                // coming into view): use the caret that editing asked for.
+                let at = usize::try_from(self.edit_cursor).unwrap_or(src.len());
+                (at, at)
+            };
+            let start = char_boundary(src, caret.min(anchor));
+            let end = char_boundary(src, caret.max(anchor));
+            let new = format!("{}{text}{}", &src[..start], &src[end..]);
+            let at = (start + text.len()) as i32;
+            self.set_block_text(i, new);
+            self.set_status("", false);
+            ui.set_saved_caret(at);
+            ui.set_saved_anchor(at);
+            ui.set_caret_seq(self.edit_seq);
+        }
+        ui.invoke_bring_back();
+        true
     }
 
     fn key_action(&mut self, i: usize, cmd: &str, text: &str, cursor: usize, anchor: usize) -> EditResult {
@@ -267,10 +333,7 @@ impl Editor {
             Action::Pass => pass,
             Action::Swallow => handled,
             Action::Replace { text, anchor, cursor } => {
-                self.doc.blocks[i].src = text.clone();
-                self.modified = true;
-                self.update_live(i);
-                self.refresh_meta();
+                self.set_block_text(i, text.clone());
                 EditResult { action: 2, text: text.into(), anchor: anchor as i32, cursor: cursor as i32 }
             }
             Action::Splice { start, removed, parts, edit, cursor } => {
@@ -350,6 +413,7 @@ impl Editor {
         self.saved_text = text;
         self.path = Some(std::path::absolute(&path).unwrap_or(path));
         self.modified = false;
+        self.with_ui(|ui| ui.invoke_scroll_to_top());
         self.rebuild();
         if self.doc.is_blank() {
             self.set_editing(Some(0), 0);
@@ -614,6 +678,26 @@ fn load_image(url: &str, base: &Path) -> Result<slint::Image, String> {
     slint::Image::load_from_path(&full).map_err(|_| format!("can't load {}", full.display()))
 }
 
+/// The largest char boundary of `s` at or before `pos`.
+fn char_boundary(s: &str, pos: usize) -> usize {
+    let mut pos = pos.min(s.len());
+    while !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
+/// Slint's key codes for Shift, Control, Alt, AltGr, Caps Lock and Meta.
+fn is_modifier_key(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| ('\u{10}'..='\u{18}').contains(&c))
+}
+
+/// Text a key press types, as opposed to a control character or one of the
+/// private-use code points Slint uses for keys like the arrows and Home.
+fn is_typed_text(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| !c.is_control() && !('\u{e000}'..='\u{f8ff}').contains(&c))
+}
+
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -682,14 +766,22 @@ fn monospace_family() -> Option<String> {
     (!first.is_empty()).then(|| first.to_owned())
 }
 
-fn install_drop_handler(app: &App, editor: Rc<RefCell<Editor>>) {
+/// Window events that need winit: dropped files, and the pointer position.
+fn install_window_events(app: &App, editor: Rc<RefCell<Editor>>) {
     use slint::winit_030::winit::event::WindowEvent;
     use slint::winit_030::{EventResult, WinitWindowAccessor};
 
     let weak = app.as_weak();
     let last_drop: StdCell<Option<Instant>> = StdCell::new(None);
-    app.window().on_winit_window_event(move |_, event| {
+    let pointer: Rc<StdCell<Option<slint::LogicalPosition>>> = Rc::new(StdCell::new(None));
+    let pointer_in = pointer.clone();
+    app.window().on_winit_window_event(move |window, event| {
         match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = window.scale_factor() as f64;
+                pointer_in.set(Some(slint::LogicalPosition::new((position.x / scale) as f32, (position.y / scale) as f32)));
+            }
+            WindowEvent::CursorLeft { .. } => pointer_in.set(None),
             WindowEvent::HoveredFile(_) => {
                 if let Some(ui) = weak.upgrade() {
                     ui.set_drop_hover(true);
@@ -722,6 +814,24 @@ fn install_drop_handler(app: &App, editor: Rc<RefCell<Editor>>) {
             _ => {}
         }
         EventResult::Propagate
+    });
+
+    // Slint refreshes the hover state right after a wheel scroll, before the
+    // list creates the rows the scroll brought into view. Move the pointer
+    // over them once more after the next frame, so that a click lands on the
+    // character under it without moving the mouse first.
+    let weak = app.as_weak();
+    let timer = Rc::new(slint::Timer::default());
+    app.on_list_scrolled(move || {
+        if pointer.get().is_none() {
+            return;
+        }
+        let (weak, pointer) = (weak.clone(), pointer.clone());
+        timer.start(slint::TimerMode::SingleShot, Duration::from_millis(20), move || {
+            if let (Some(ui), Some(position)) = (weak.upgrade(), pointer.get()) {
+                ui.window().dispatch_event(slint::platform::WindowEvent::PointerMoved { position });
+            }
+        });
     });
 }
 
@@ -825,6 +935,10 @@ fn wire(app: &App, editor: &Rc<RefCell<Editor>>) {
     let ed = editor.clone();
     app.on_confirm_choice(move |choice| ed.borrow_mut().confirm(choice));
     let ed = editor.clone();
+    app.on_finish_edit(move || ed.borrow_mut().request_edit(None, None));
+    let ed = editor.clone();
+    app.on_key_away(move |text, command| ed.borrow_mut().key_away(&text, command));
+    let ed = editor.clone();
     app.window().on_close_requested(move || {
         let Ok(mut ed) = ed.try_borrow_mut() else { return CloseRequestResponse::KeepWindowShown };
         if ed.guard(Pending::Close) { CloseRequestResponse::HideWindow } else { CloseRequestResponse::KeepWindowShown }
@@ -858,7 +972,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     wire(&app, &editor);
     wire_theme(&app, settings);
-    install_drop_handler(&app, editor.clone());
+    install_window_events(&app, editor.clone());
 
     app.run()?;
     Ok(())

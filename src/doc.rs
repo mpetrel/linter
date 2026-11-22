@@ -162,9 +162,7 @@ impl Document {
     }
 
     pub fn word_count(&self) -> (usize, usize) {
-        let words = self.blocks.iter().map(|b| b.src.split_whitespace().count()).sum();
-        let chars = self.blocks.iter().map(|b| b.src.chars().filter(|c| !c.is_whitespace()).count()).sum();
-        (words, chars)
+        self.blocks.iter().map(|b| word_count(&b.src)).fold((0, 0), |(w, c), (bw, bc)| (w + bw, c + bc))
     }
 
     /// Replaces `blocks[start..start + removed]` with `parts`.
@@ -345,6 +343,11 @@ impl Document {
 }
 
 pub type LinkRefs = HashMap<String, (String, String)>;
+
+/// Words and non-whitespace characters in `text`.
+pub fn word_count(text: &str) -> (usize, usize) {
+    (text.split_whitespace().count(), text.chars().filter(|c| !c.is_whitespace()).count())
+}
 
 pub fn normalize_label(label: &str) -> String {
     label.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
