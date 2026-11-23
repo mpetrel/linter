@@ -23,7 +23,7 @@ rm -rf "$stage"
 mkdir -p "$stage/examples"
 cp "target/$target/release/linter.exe" "$stage/"
 x86_64-w64-mingw32-strip "$stage/linter.exe"
-cp README.md "$stage/"
+cp README.md LICENSE "$stage/"
 cp examples/sample.md examples/sample.png "$stage/examples/"
 
 setup="$out/linter-$version-setup.exe"

@@ -1,7 +1,7 @@
 ; NSIS script for the linter Windows installer.
 ; Built by packaging/windows/build-installer.sh, which defines:
 ;   VERSION  the version from Cargo.toml (e.g. 0.1.0)
-;   STAGE    a folder holding linter.exe, README.md and examples\
+;   STAGE    a folder holding linter.exe, README.md, LICENSE and examples\
 ;   OUTFILE  the installer to write
 ;   ICON     the .ico file for the installer and uninstaller
 
@@ -117,6 +117,7 @@ Section "${APP} (required)" SecApp
   SetOutPath "$INSTDIR"
   File "${STAGE}/${EXE}"
   File "${STAGE}/README.md"
+  File "${STAGE}/LICENSE"
   SetOutPath "$INSTDIR\examples"
   File "${STAGE}/examples/sample.md"
   File "${STAGE}/examples/sample.png"
@@ -196,6 +197,7 @@ Section "Uninstall"
 
   Delete "$INSTDIR\${EXE}"
   Delete "$INSTDIR\README.md"
+  Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\examples\sample.md"
   Delete "$INSTDIR\examples\sample.png"
   RMDir "$INSTDIR\examples"
