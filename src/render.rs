@@ -5,8 +5,8 @@
 //! underline). Block structure (headings, lists, quotes, tables, code) is
 //! described separately and laid out by the UI.
 
-use crate::doc::{self, Kind, LinkRefs};
-use pulldown_cmark::{Alignment, BrokenLink, CodeBlockKind, CowStr, Event, Parser, Tag, TagEnd};
+use crate::doc::{self, Kind, LinkRefs, parser};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Tag, TagEnd};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Line {
@@ -57,7 +57,7 @@ pub struct Rendered {
 }
 
 pub fn render(src: &str, refs: &LinkRefs) -> Rendered {
-    let kind = doc::classify(src);
+    let kind = doc::classify_with(src, refs);
     let mut out = Rendered {
         kind,
         lines: Vec::new(),
@@ -104,14 +104,6 @@ pub fn render(src: &str, refs: &LinkRefs) -> Rendered {
         Kind::Rule | Kind::Empty => {}
     }
     out
-}
-
-fn parser<'a>(src: &'a str, refs: &'a LinkRefs) -> impl Iterator<Item = Event<'a>> + 'a {
-    let callback = move |link: BrokenLink<'a>| {
-        refs.get(&doc::normalize_label(&link.reference))
-            .map(|(url, title)| (CowStr::from(url.clone()), CowStr::from(title.clone())))
-    };
-    Parser::new_with_broken_link_callback(src, doc::options(), Some(callback))
 }
 
 fn table<'a>(src: &'a str, refs: &'a LinkRefs, out: &mut Rendered) {
@@ -568,6 +560,16 @@ mod tests {
     fn image_block() {
         let out = r("![A cat](cat.png)");
         assert_eq!(out.image, Some(("cat.png".into(), "A cat".into())));
+        let out = r("![a *styled* label](photo.png)");
+        assert_eq!(out.kind, Kind::Image);
+        assert_eq!(out.image, Some(("photo.png".into(), "a styled label".into())));
+
+        // A reference image, defined in another block.
+        let mut refs = LinkRefs::new();
+        refs.insert("photo".into(), ("photo.png".into(), String::new()));
+        let out = render("![alt][photo]", &refs);
+        assert_eq!(out.kind, Kind::Image);
+        assert_eq!(out.image, Some(("photo.png".into(), "alt".into())));
     }
 
     #[test]

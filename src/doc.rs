@@ -5,7 +5,7 @@
 //! whitespace that followed it, so a file that is opened and saved without
 //! edits is written back byte-for-byte.
 
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{BrokenLink, BrokenLinkCallback, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -500,12 +500,28 @@ fn block_ranges(text: &str) -> Vec<Range<usize>> {
     out
 }
 
+/// A parser for one block that resolves reference links and images with the
+/// definitions in `refs`, which may be in other blocks.
+pub fn parser<'a>(src: &'a str, refs: &'a LinkRefs) -> Parser<'a, impl BrokenLinkCallback<'a>> {
+    let callback = move |link: BrokenLink<'a>| {
+        refs.get(&normalize_label(&link.reference))
+            .map(|(url, title)| (CowStr::from(url.clone()), CowStr::from(title.clone())))
+    };
+    Parser::new_with_broken_link_callback(src, options(), Some(callback))
+}
+
 /// Determines the kind of a block from its source.
 pub fn classify(src: &str) -> Kind {
+    classify_with(src, &LinkRefs::new())
+}
+
+/// The kind of a block, with the document's link reference definitions:
+/// `![alt][label]` alone is an image if `label` is defined.
+pub fn classify_with(src: &str, refs: &LinkRefs) -> Kind {
     if src.trim().is_empty() {
         return Kind::Empty;
     }
-    let mut events = Parser::new_ext(src, options());
+    let mut events = parser(src, refs);
     let tag = loop {
         match events.next() {
             Some(Event::Start(tag)) => break tag,
@@ -535,15 +551,26 @@ pub fn classify(src: &str) -> Kind {
 /// link), returns its URL and alt text.
 pub fn lone_image<'a>(events: &mut impl Iterator<Item = Event<'a>>) -> Option<(String, String)> {
     let mut found: Option<(String, String)> = None;
-    let mut in_image = false;
+    // Images open inside the one found: its alt text can hold emphasis,
+    // links and even other images, and is their plain text.
+    let mut depth = 0;
     for event in events {
+        if depth > 0 {
+            let alt = &mut found.as_mut()?.1;
+            match event {
+                Event::Start(Tag::Image { .. }) => depth += 1,
+                Event::End(TagEnd::Image) => depth -= 1,
+                Event::Text(t) | Event::Code(t) | Event::InlineMath(t) => alt.push_str(&t),
+                Event::SoftBreak | Event::HardBreak => alt.push(' '),
+                _ => {}
+            }
+            continue;
+        }
         match event {
             Event::Start(Tag::Image { dest_url, .. }) if found.is_none() => {
                 found = Some((dest_url.to_string(), String::new()));
-                in_image = true;
+                depth = 1;
             }
-            Event::End(TagEnd::Image) => in_image = false,
-            Event::Text(t) | Event::Code(t) if in_image => found.as_mut()?.1.push_str(&t),
             Event::Text(t) if t.trim().is_empty() => {}
             Event::Start(Tag::Link { .. }) | Event::End(TagEnd::Link) | Event::SoftBreak => {}
             Event::End(TagEnd::Paragraph) => return found,
@@ -577,12 +604,18 @@ pub fn opening_fence(src: &str) -> Option<Fence> {
 }
 
 pub fn fence_closed(src: &str, fence: &Fence) -> bool {
-    src.lines().skip(1).any(|line| {
+    closing_fence_line(src, fence).is_some()
+}
+
+/// The index of the line that closes the code fence opened on the first line.
+pub fn closing_fence_line(src: &str, fence: &Fence) -> Option<usize> {
+    src.lines().enumerate().skip(1).find_map(|(n, line)| {
         let t = line.trim_start_matches(' ');
-        line.len() - t.len() <= 3 && {
+        let closes = line.len() - t.len() <= 3 && {
             let run = t.len() - t.trim_start_matches(fence.ch).len();
             run >= fence.len && t[run..].trim().is_empty()
-        }
+        };
+        closes.then_some(n)
     })
 }
 
@@ -645,6 +678,41 @@ mod tests {
         assert_eq!(classify("![alt](a.png)"), Kind::Image);
         assert_eq!(classify("[![alt](a.png)](http://x)"), Kind::Image);
         assert_eq!(classify("text ![alt](a.png)"), Kind::Paragraph);
+        assert_eq!(classify("![alt](a.png) text"), Kind::Paragraph);
+        assert_eq!(classify("![a](a.png) ![b](b.png)"), Kind::Paragraph);
+    }
+
+    fn image(src: &str, refs: &LinkRefs) -> Option<(String, String)> {
+        let mut events = parser(src, refs);
+        assert!(matches!(events.next(), Some(Event::Start(Tag::Paragraph))), "{src:?}");
+        lone_image(&mut events)
+    }
+
+    #[test]
+    fn styled_alt_text_is_still_an_image() {
+        let none = LinkRefs::new();
+        for (src, alt) in [
+            ("![a *styled* label](p.png)", "a styled label"),
+            ("![**bold** and `code`](p.png)", "bold and code"),
+            ("![see [link](http://x) here](p.png)", "see link here"),
+            ("![outer ![inner](i.png) text](p.png)", "outer inner text"),
+            ("![two\nlines](p.png)", "two lines"),
+        ] {
+            assert_eq!(classify(src), Kind::Image, "{src:?}");
+            assert_eq!(image(src, &none), Some(("p.png".into(), alt.into())), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn reference_images_use_the_document_definitions() {
+        let doc = Document::parse("![A photo][photo]\n\n![photo]\n\n![photo][]\n\n![x][missing]\n\n[Photo]: pics/p.png\n");
+        let refs = doc.link_refs();
+        let kinds: Vec<Kind> = doc.blocks.iter().map(|b| classify_with(&b.src, &refs)).collect();
+        assert_eq!(kinds, [Kind::Image, Kind::Image, Kind::Image, Kind::Paragraph, Kind::Raw]);
+        assert_eq!(image(&doc.blocks[0].src, &refs), Some(("pics/p.png".into(), "A photo".into())));
+        assert_eq!(image(&doc.blocks[1].src, &refs), Some(("pics/p.png".into(), "photo".into())));
+        // Without the definitions, it's text.
+        assert_eq!(classify(&doc.blocks[0].src), Kind::Paragraph);
     }
 
     #[test]

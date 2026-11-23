@@ -394,6 +394,20 @@ fn shots_review() {
     assert!(!editor.borrow_mut().guard(Pending::Close), "closing must ask again");
     editor.borrow_mut().confirm(2);
 
+    // Tab over the lines of a code block indents them, the fences aside, and
+    // keeps them selected; Shift+Tab takes the indentation off again.
+    open("tab.md", "```\na\nb\n```\n");
+    edit(0);
+    h.ctrl("a");
+    h.key(Key::Tab);
+    assert_eq!(editor.borrow().doc.blocks[0].src, "```\n    a\n    b\n```");
+    let shift = SharedString::from(Key::Shift);
+    h.window.dispatch_event(WindowEvent::KeyPressed { text: shift.clone() });
+    h.key(Key::Tab);
+    h.window.dispatch_event(WindowEvent::KeyReleased { text: shift });
+    assert_eq!(editor.borrow().doc.blocks[0].src, "```\na\nb\n```");
+    h.key(Key::Escape);
+
     std::fs::remove_dir_all(&dir).unwrap();
     println!("review checks passed");
 }
@@ -678,6 +692,38 @@ fn shots_focus() {
     assert_eq!(src(10), "Paragraph 10.Z");
     h.key(Key::Escape);
 
+    // Ctrl+B pressed and let go while the block is scrolled away: once the
+    // block is back, it's played to the text field as Ctrl+B, which makes the
+    // selection bold instead of typing a "b" over it. Ctrl is up again after.
+    edit(20);
+    h.ctrl("a");
+    h.scroll(-20000.0);
+    let (ctrl, shift): (SharedString, SharedString) = (Key::Control.into(), Key::Shift.into());
+    h.window.dispatch_event(WindowEvent::KeyPressed { text: ctrl.clone() });
+    h.press("b");
+    h.window.dispatch_event(WindowEvent::KeyReleased { text: ctrl.clone() });
+    h.wait();
+    assert_eq!(src(20), "**Paragraph 20.**");
+    assert!(!app.get_modifiers().control);
+    h.type_text("x");
+    assert_eq!(src(20), "**x**", "typing replaces the selection, without Ctrl");
+    h.key(Key::Escape);
+
+    // The other way round: Left pressed alone, then Shift held before the
+    // block is back. Left moves the caret instead of selecting, and Shift is
+    // still held after.
+    edit(21);
+    h.scroll(-20000.0);
+    h.press(Key::LeftArrow);
+    h.window.dispatch_event(WindowEvent::KeyPressed { text: shift.clone() });
+    h.wait();
+    assert!(app.get_modifiers().shift);
+    h.press("X");
+    h.window.dispatch_event(WindowEvent::KeyReleased { text: shift });
+    h.settle();
+    assert_eq!(src(21), "Paragraph 21X.");
+    h.key(Key::Escape);
+
     // Closing the About dialog leaves the list where it is.
     edit(10);
     h.scroll(-20000.0);
@@ -923,4 +969,65 @@ fn shots_images() {
     wait(&|| row(10).image.size().width == 2460);
     assert_eq!(row(10).image.size().height, 615);
     let _ = std::fs::remove_dir_all(&docs);
+}
+
+/// Images load when their block comes into view, and beyond the memory
+/// budget the ones out of view longest are dropped, from the blocks too. No
+/// screenshots.
+#[test]
+#[ignore]
+fn shots_images_in_view() {
+    use crate::images::tests::{encode, gradient};
+    use image::{DynamicImage, ImageFormat};
+
+    let dir = std::env::temp_dir().join(format!("linter-images-in-view-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // 400 × 300, shown as they are: 360 000 bytes each.
+    for n in 0..4 {
+        std::fs::write(dir.join(format!("{n}.png")), encode(&DynamicImage::ImageRgb8(gradient(400, 300)), ImageFormat::Png)).unwrap();
+    }
+    let paragraphs: String = (0..400).map(|i| format!("Paragraph {i}.\n\n")).collect();
+    let file = dir.join("long.md");
+    std::fs::write(&file, format!("# Top\n\n![0](0.png)\n\n![1](1.png)\n\n{paragraphs}![2](2.png)\n\n![3](3.png)\n")).unwrap();
+    // Blocks: 0 the heading, 1 and 2 the images at the top, 403 and 404 the ones at the end.
+    let (top, end) = ([1, 2], [403, 404]);
+
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    let app = App::new().unwrap();
+    window.set_size(PhysicalSize::new(W, H));
+    let editor = Rc::new(RefCell::new(Editor::new(&app)));
+    // Room for three of them.
+    editor.borrow_mut().images = images::Images::with_budget(3 * 360_000 + 1000);
+    wire(&app, &editor);
+    app.show().unwrap();
+    let h = Harness { window, app: app.as_weak(), dir: dir.clone() };
+    let shown = |i: usize| editor.borrow().model.row_data(i).unwrap().has_image;
+    let wait = |done: &dyn Fn() -> bool, what: &str| {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(10), "{what}");
+            h.settle();
+        }
+    };
+
+    editor.borrow_mut().load(file);
+    wait(&|| top.iter().all(|&i| shown(i)), "the images in view load");
+    h.wait();
+    assert_eq!(editor.borrow().images.requested(), 2, "only the images in view were asked for");
+    assert!(!end.iter().any(|&i| shown(i)));
+
+    // At the end, its images load, and one shown at the top is let go of.
+    h.scroll(-1_000_000.0);
+    wait(&|| end.iter().all(|&i| shown(i)), "the images at the end load");
+    wait(&|| top.iter().filter(|&&i| shown(i)).count() == 1, "one image at the top is dropped");
+
+    // Back at the top, both load again; one at the end makes room.
+    h.scroll(1_000_000.0);
+    wait(&|| top.iter().all(|&i| shown(i)), "the images at the top load again");
+    assert_eq!(end.iter().filter(|&&i| shown(i)).count(), 1);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    println!("images in view checks passed");
 }

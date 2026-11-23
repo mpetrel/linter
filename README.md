@@ -52,7 +52,7 @@ Building needs a C compiler (for libwebp) and, on Linux, the OpenSSL headers
 | `Ctrl+=` / `Ctrl+-` | Promote / demote a heading (fewer / more `#`). |
 | `Ctrl+1` … `Ctrl+6`, `Ctrl+0` | Make the block a heading of that level, or a paragraph. |
 | `Ctrl+B` / `Ctrl+I` | Toggle `**bold**` / `*italic*` around the selection. |
-| `Tab` / `Shift+Tab` | Indent / outdent a list item, together with its sub-items. |
+| `Tab` / `Shift+Tab` | Indent / outdent a list item, together with its sub-items. In code: `Tab` types four spaces, or indents the selected lines; `Shift+Tab` outdents the line or the selected lines. |
 | `Esc` | Stop editing. |
 
 Typing ` ```lang ` and pressing `Enter` creates a closed code block. An unclosed code fence
@@ -73,7 +73,8 @@ text.
 
 ### Images
 
-An image on its own line (`![alt](path-or-url)`) is shown in place of the block:
+An image on its own line (`![alt](path-or-url)`, or `![alt][label]` with `[label]: path-or-url`
+anywhere in the file) is shown in place of the block:
 
 - **Formats:** PNG, JPEG, GIF, WebP, SVG, BMP, ICO, TIFF, TGA, PNM and QOI. Animated GIF
   and WebP show their first frame. JPEG photos are turned upright by their Exif
@@ -86,8 +87,11 @@ An image on its own line (`![alt](path-or-url)`) is shown in place of the block:
   the system proxy setting; images from this machine (`localhost`, `127.0.0.1`) bypass
   it. Downloads aren't kept on disk: opening the file again downloads them again.
 
-Images load in the background: a block shows *loading…* until its image is ready, or the
-reason it can't be shown. Images wider than the column can show (at the screen's scale,
+Images load in the background, once their block is in view, the newest first: a block
+shows *loading…* until its image is ready, or the reason it can't be shown. Decoded images
+are kept up to 256 MB; beyond that the ones shown longest ago are let go of, and load again
+when they come back into view. Downloads still running for a file that was closed don't
+hold up the images of the next one. Images wider than the column can show (at the screen's scale,
 and at least 2×) are scaled down while they're decoded, so large photos are quick to show
 and don't use much memory; on a screen with a larger scale they're decoded again.
 Decoders: zune-jpeg, or jpeg-decoder for photos at least twice too large, since it can
@@ -138,6 +142,8 @@ SHOT_DIR=/tmp/shots cargo test shots::shots -- --exact --ignored   # headless UI
 cargo test shots::shots_review -- --exact --ignored               # UI regression checks
 cargo test shots::shots_large_document -- --exact --ignored       # editing a long document
 cargo test shots::shots_mixed_heights -- --exact --ignored        # blocks of different heights
+cargo test shots::shots_focus -- --exact --ignored                # keys while the block is out of view
+cargo test shots::shots_images_in_view -- --exact --ignored       # images load in view, memory budget
 SHOT_DIR=/tmp/shots cargo test shots::shots_theme -- --exact --ignored   # theme menu, dark theme, About
 SHOT_DIR=/tmp/shots cargo test shots::shots_images -- --exact --ignored  # images: formats, web, errors
 ```

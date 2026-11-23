@@ -41,6 +41,14 @@ export struct Block {
     caption: string,
 }
 
+// The modifier keys held, as a key event reports them.
+export struct Modifiers {
+    control: bool,
+    alt: bool,
+    shift: bool,
+    meta: bool,
+}
+
 // action: 0 = let the text field handle the key, 1 = handled, 2 = replace text
 export struct EditResult {
     action: int,
@@ -669,6 +677,22 @@ component BlockRow {
     callback focused(index: int);
     callback click-blank();
     callback click-below();
+    // The list shows the row of an image block: its image loads now. The row
+    // asks again whenever its data is set, which Rust does to have the rows
+    // in view load their image again.
+    callback show-image(index: int);
+
+    init => {
+        root.check-image();
+    }
+    changed data => {
+        root.check-image();
+    }
+    function check-image() {
+        if root.data.kind == BlockKind.image {
+            root.show-image(root.index);
+        }
+    }
 
     property <length> pad-top: root.first ? 36px : 0px;
     property <length> pad-bottom: root.last ? 160px : 0px;
@@ -930,10 +954,12 @@ export component App inherits Window {
     // The document list scrolled.
     callback list-scrolled();
     // Any other key then: types `text` into that block if it's text and no
-    // modifier (`command`) is held. Returns whether the key was used.
-    callback key-away(text: string, command: bool) -> bool;
+    // modifier but Shift is held. Returns whether the key was used.
+    callback key-away(text: string, modifiers: Modifiers) -> bool;
     // The text field of the block being edited got the focus (back).
     callback edit-focused();
+    // The list shows the row of image block `index`.
+    callback show-image(index: int);
 
     // The caret of edit session `caret-seq`, saved as the block being edited
     // reports it, so that it can be put back when that block is created again
@@ -941,6 +967,9 @@ export component App inherits Window {
     in-out property <int> caret-seq: -1;
     in-out property <int> saved-caret;
     in-out property <int> saved-anchor;
+    // The modifier keys held now, as of the last key event: Rust replays keys
+    // with the modifiers they were pressed with, and puts these back after.
+    out property <Modifiers> modifiers;
     property <length> column-x: max(80px, (sv.visible-width - Theme.column) / 2);
     property <length> column-width: min(Theme.column, sv.visible-width - 160px);
 
@@ -1132,7 +1161,7 @@ export component App inherits Window {
 
     property <BlockKind> editing-kind: root.editing-index >= 0 ? root.blocks[root.editing-index].kind : BlockKind.empty;
     property <int> editing-level: root.editing-index >= 0 ? root.blocks[root.editing-index].level : 0;
-    property <string> hint: root.editing-index < 0 ? "Click a block to edit its Markdown" : root.editing-kind == BlockKind.heading ? "Heading \{root.editing-level}  ·  edit the #'s, or Ctrl+= / Ctrl+- to change level  ·  Ctrl+0 paragraph  ·  Esc done" : root.editing-kind == BlockKind.list ? "List  ·  Enter next item  ·  Tab / Shift+Tab indent  ·  Enter on empty item ends the list" : root.editing-kind == BlockKind.quote ? "Quote  ·  Enter continues  ·  Enter on an empty line ends the quote" : root.editing-kind == BlockKind.code ? "Code  ·  Enter new line  ·  Ctrl+Enter or ↓ at the end leaves the block" : root.editing-kind == BlockKind.table ? "Table  ·  edit the rows as text  ·  Ctrl+Enter adds a paragraph below" : "Text  ·  Ctrl+1…6 heading  ·  Ctrl+B / Ctrl+I  ·  Shift+Enter line break  ·  Esc done";
+    property <string> hint: root.editing-index < 0 ? "Click a block to edit its Markdown" : root.editing-kind == BlockKind.heading ? "Heading \{root.editing-level}  ·  edit the #'s, or Ctrl+= / Ctrl+- to change level  ·  Ctrl+0 paragraph  ·  Esc done" : root.editing-kind == BlockKind.list ? "List  ·  Enter next item  ·  Tab / Shift+Tab indent  ·  Enter on empty item ends the list" : root.editing-kind == BlockKind.quote ? "Quote  ·  Enter continues  ·  Enter on an empty line ends the quote" : root.editing-kind == BlockKind.code ? "Code  ·  Enter new line  ·  Tab / Shift+Tab indent  ·  Ctrl+Enter or ↓ at the end leaves the block" : root.editing-kind == BlockKind.table ? "Table  ·  edit the rows as text  ·  Ctrl+Enter adds a paragraph below" : "Text  ·  Ctrl+1…6 heading  ·  Ctrl+B / Ctrl+I  ·  Shift+Enter line break  ·  Esc done";
 
     // `y` is in list content coordinates.
     function scroll-into-view(y: length, h: length) {
@@ -1146,8 +1175,19 @@ export component App inherits Window {
         }
     }
 
+    pure function modifiers-of(m: KeyboardModifiers) -> Modifiers {
+        return { control: m.control, alt: m.alt, shift: m.shift, meta: m.meta };
+    }
+
     fs := FocusScope {
+        // Every key event while anything in the window has the focus passes
+        // here first.
+        capture-key-released(e) => {
+            root.modifiers = root.modifiers-of(e.modifiers);
+            return EventResult.reject;
+        }
         capture-key-pressed(e) => {
+            root.modifiers = root.modifiers-of(e.modifiers);
             // The dialogs are modal. Unsaved changes: Esc cancels, Enter saves.
             if root.confirm-open {
                 if e.text == Key.Escape {
@@ -1190,7 +1230,7 @@ export component App inherits Window {
                 root.finish-edit();
                 return EventResult.accept;
             }
-            return root.key-away(e.text, e.modifiers.control || e.modifiers.alt || e.modifiers.meta) ? EventResult.accept : EventResult.reject;
+            return root.key-away(e.text, root.modifiers-of(e.modifiers)) ? EventResult.accept : EventResult.reject;
         }
 
         VerticalLayout {
@@ -1346,6 +1386,9 @@ export component App inherits Window {
                         }
                         click-below => {
                             root.click-below();
+                        }
+                        show-image(index) => {
+                            root.show-image(index);
                         }
                     }
                 }

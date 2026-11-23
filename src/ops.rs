@@ -4,7 +4,7 @@
 //! byte offsets) and decides what should happen: let the text field handle
 //! the key, rewrite the block in place, or restructure the block list.
 
-use crate::doc::{self, Document, Kind};
+use crate::doc::{self, Document, Kind, LinkRefs};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cursor {
@@ -29,15 +29,25 @@ pub enum Action {
     Finish,
 }
 
-pub fn run(doc: &Document, i: usize, cmd: &str, text: &str, cursor: usize, anchor: usize) -> Action {
+/// `refs` are the document's link reference definitions: with them,
+/// `![alt][label]` on its own is an image block, as it's shown.
+pub fn run(doc: &Document, refs: &LinkRefs, i: usize, cmd: &str, text: &str, cursor: usize, anchor: usize) -> Action {
     let cursor = clamp(text, cursor);
     let anchor = clamp(text, anchor);
-    let kind = doc::classify(text);
+    let classify = |src: &str| doc::classify_with(src, refs);
+    let kind = classify(text);
     match cmd {
+        // Enter replaces the selection, as in any text field: it acts on the
+        // text without it. (On `Pass` the text field deletes it itself.)
+        "enter" if anchor != cursor => {
+            let (a, b) = (anchor.min(cursor), anchor.max(cursor));
+            let rest = format!("{}{}", &text[..a], &text[b..]);
+            enter(i, classify(&rest), &rest, a)
+        }
         "enter" => enter(i, kind, text, cursor),
         "ctrl-enter" => Action::Splice { start: i, removed: 1, parts: vec![text.into(), String::new()], edit: 1, cursor: 0 },
-        "backspace" if cursor == 0 && anchor == 0 => merge_prev(doc, i, kind, text),
-        "delete" if cursor == text.len() && anchor == cursor => merge_next(doc, i, kind, text),
+        "backspace" if cursor == 0 && anchor == 0 => merge_prev(doc, i, kind, text, &classify),
+        "delete" if cursor == text.len() && anchor == cursor => merge_next(doc, i, kind, text, &classify),
         "backspace" | "delete" => Action::Pass,
         "up" if i > 0 => Action::Move { to: i - 1, cursor: Cursor::End },
         "down" if i + 1 < doc.blocks.len() => Action::Move { to: i + 1, cursor: Cursor::At(0) },
@@ -69,7 +79,7 @@ pub fn run(doc: &Document, i: usize, cmd: &str, text: &str, cursor: usize, ancho
         }
         "tab" | "backtab" => match kind {
             Kind::List => indent(text, cursor, anchor, cmd == "backtab"),
-            Kind::Code { .. } if cmd == "tab" => insert(text, cursor, "    "),
+            Kind::Code { fenced } => code_indent(text, fenced, cursor, anchor, cmd == "backtab"),
             _ => Action::Swallow,
         },
         _ => Action::Swallow,
@@ -309,6 +319,92 @@ fn indent(text: &str, cursor: usize, anchor: usize, outdent: bool) -> Action {
     Action::Replace { text: new, anchor: shift(anchor), cursor: shift(cursor) }
 }
 
+/// Tab and Shift+Tab in a code block. Tab types four spaces, over the
+/// selection if it's within a line; a selection over several lines is
+/// indented by four spaces instead. Shift+Tab takes up to four spaces (or a
+/// tab) off the start of the cursor's line, or of each line of the selection.
+/// The fence lines of a fenced block stay as they are, and an indented block
+/// keeps the four spaces that make it code.
+fn code_indent(text: &str, fenced: bool, cursor: usize, anchor: usize, outdent: bool) -> Action {
+    let (a, b) = (anchor.min(cursor), anchor.max(cursor));
+    if !outdent && !text[a..b].contains('\n') {
+        let new = format!("{}    {}", &text[..a], &text[b..]);
+        return Action::Replace { text: new, anchor: a + 4, cursor: a + 4 };
+    }
+    // The lines of the selection, without one it only reaches the start of.
+    let first = line_bounds(text, a).0;
+    let last = if b > a && text[..b].ends_with('\n') { b - 1 } else { b };
+    let code_lines = match doc::opening_fence(text).filter(|_| fenced) {
+        Some(fence) => 1..doc::closing_fence_line(text, &fence).unwrap_or(usize::MAX),
+        None => 0..usize::MAX,
+    };
+    // (at, removed, inserted): spaces taken off or put in at `at`.
+    let mut edits: Vec<(usize, usize, usize)> = Vec::new();
+    let starts = std::iter::once(0).chain(text.match_indices('\n').map(|(p, _)| p + 1));
+    for (n, start) in starts.enumerate() {
+        if start < first || !code_lines.contains(&n) {
+            continue;
+        }
+        if start > last {
+            break;
+        }
+        let line = &text[start..line_bounds(text, start).1];
+        if !outdent {
+            if !line.trim().is_empty() {
+                edits.push((start, 0, 4));
+            }
+            continue;
+        }
+        let base = if fenced { 0 } else { code_indent_len(line) };
+        let rest = &line[base..];
+        let spaces = rest.bytes().take(4).take_while(|&c| c == b' ').count();
+        let removed = if spaces == 0 && rest.starts_with('\t') { 1 } else { spaces };
+        if removed > 0 {
+            edits.push((start + base, removed, 0));
+        }
+    }
+    if edits.is_empty() {
+        return Action::Swallow;
+    }
+    let mut new = String::with_capacity(text.len() + 4 * edits.len());
+    let mut copied = 0;
+    for &(at, removed, inserted) in &edits {
+        new.push_str(&text[copied..at]);
+        new.push_str(&" ".repeat(inserted));
+        copied = at + removed;
+    }
+    new.push_str(&text[copied..]);
+    // A position moves with the text before it; one in spaces taken off
+    // goes to where they were.
+    let map = |pos: usize| {
+        let mut moved = pos as isize;
+        for &(at, removed, inserted) in edits.iter().take_while(|&&(at, ..)| at < pos) {
+            moved += inserted as isize - removed.min(pos - at) as isize;
+        }
+        moved as usize
+    };
+    Action::Replace { text: new, anchor: map(anchor), cursor: map(cursor) }
+}
+
+/// The length of the indentation that makes `line` part of an indented code
+/// block: up to four columns of spaces and tabs.
+fn code_indent_len(line: &str) -> usize {
+    let mut column = 0;
+    let mut len = 0;
+    for c in line.chars() {
+        if column >= 4 {
+            break;
+        }
+        match c {
+            ' ' => column += 1,
+            '\t' => column = (column / 4 + 1) * 4,
+            _ => break,
+        }
+        len += 1;
+    }
+    len
+}
+
 /// Returns the level and prefix length of an ATX heading (`## `).
 pub fn heading_prefix(src: &str) -> Option<(u8, usize)> {
     let indent = src.len() - src.trim_start_matches(' ').len();
@@ -395,7 +491,7 @@ fn joiner(first: Kind, second: Kind) -> &'static str {
     }
 }
 
-fn merge_prev(doc: &Document, i: usize, kind: Kind, text: &str) -> Action {
+fn merge_prev(doc: &Document, i: usize, kind: Kind, text: &str, classify: &dyn Fn(&str) -> Kind) -> Action {
     if i == 0 {
         return if text.is_empty() && doc.blocks.len() > 1 {
             Action::Splice { start: 0, removed: 2, parts: vec![doc.blocks[1].src.clone()], edit: 0, cursor: 0 }
@@ -404,7 +500,7 @@ fn merge_prev(doc: &Document, i: usize, kind: Kind, text: &str) -> Action {
         };
     }
     let prev = &doc.blocks[i - 1].src;
-    let prev_kind = doc::classify(prev);
+    let prev_kind = classify(prev);
     if text.is_empty() {
         return Action::Splice { start: i - 1, removed: 2, parts: vec![prev.clone()], edit: 0, cursor: prev.len() };
     }
@@ -419,9 +515,9 @@ fn merge_prev(doc: &Document, i: usize, kind: Kind, text: &str) -> Action {
     Action::Splice { start: i - 1, removed: 2, parts: vec![format!("{prev}{sep}{text}")], edit: 0, cursor }
 }
 
-fn merge_next(doc: &Document, i: usize, kind: Kind, text: &str) -> Action {
+fn merge_next(doc: &Document, i: usize, kind: Kind, text: &str, classify: &dyn Fn(&str) -> Kind) -> Action {
     let Some(next) = doc.blocks.get(i + 1).map(|b| &b.src) else { return Action::Swallow };
-    let next_kind = doc::classify(next);
+    let next_kind = classify(next);
     if matches!(next_kind, Kind::Rule | Kind::Empty) {
         return Action::Splice { start: i, removed: 2, parts: vec![text.into()], edit: 0, cursor: text.len() };
     }
@@ -438,6 +534,11 @@ mod tests {
 
     fn doc(text: &str) -> Document {
         Document::parse(text)
+    }
+
+    /// `super::run`, in a document without link reference definitions.
+    fn run(d: &Document, i: usize, cmd: &str, text: &str, cursor: usize, anchor: usize) -> Action {
+        super::run(d, &LinkRefs::new(), i, cmd, text, cursor, anchor)
     }
 
     fn replace(a: Action) -> (String, usize) {
@@ -470,6 +571,27 @@ mod tests {
             run(&d, 0, "enter", "## Title", 1, 1),
             Action::Splice { start: 0, removed: 1, parts: vec!["".into(), "## Title".into()], edit: 0, cursor: 0 }
         );
+    }
+
+    #[test]
+    fn enter_replaces_the_selection() {
+        let d = doc("hello big world\n");
+        // All of it: an empty paragraph is left to type in.
+        assert_eq!(
+            run(&d, 0, "enter", "hello big world", 15, 0),
+            Action::Splice { start: 0, removed: 1, parts: vec!["".into(), "".into()], edit: 1, cursor: 0 }
+        );
+        // Part of it, selected either way.
+        for (cursor, anchor) in [(10, 6), (6, 10)] {
+            assert_eq!(
+                run(&d, 0, "enter", "hello big world", cursor, anchor),
+                Action::Splice { start: 0, removed: 1, parts: vec!["hello".into(), "world".into()], edit: 1, cursor: 0 }
+            );
+        }
+        // In a list, the next item starts where the selection was.
+        assert_eq!(replace(run(&d, 0, "enter", "- one two", 9, 5)), ("- one\n- ".into(), 8));
+        // A code block: the text field types the line break over it.
+        assert_eq!(run(&d, 0, "enter", "```\nab\n```", 6, 4), Action::Pass);
     }
 
     #[test]
@@ -637,6 +759,52 @@ mod tests {
             run(&d, 0, "tab", "- a\n- b\n  - c", 7, 13),
             Action::Replace { text: "- a\n  - b\n    - c".into(), anchor: 17, cursor: 9 }
         );
+    }
+
+    #[test]
+    fn reference_images_merge_like_images() {
+        let d = doc("![a][photo]\n\ntext\n\n[photo]: p.png\n");
+        let refs = d.link_refs();
+        // Backspace at the start of the next block moves into the image block,
+        // as it does after `![a](p.png)`, instead of joining its text to it.
+        assert_eq!(super::run(&d, &refs, 1, "backspace", "text", 0, 0), Action::Move { to: 0, cursor: Cursor::End });
+        assert_eq!(super::run(&d, &refs, 0, "delete", "![a][photo]", 11, 11), Action::Swallow);
+        // Without the definition it's a paragraph, and they're joined.
+        assert!(matches!(run(&d, 1, "backspace", "text", 0, 0), Action::Splice { .. }));
+    }
+
+    #[test]
+    fn tab_in_code() {
+        let d = doc("x\n");
+        let code = "```\na\n\n  b\n```";
+        // No selection, or one within a line: four spaces are typed.
+        assert_eq!(replace(run(&d, 0, "tab", code, 5, 5)), ("```\na    \n\n  b\n```".into(), 9));
+        assert_eq!(replace(run(&d, 0, "tab", "```\nabc\n```", 6, 5)), ("```\na    c\n```".into(), 9));
+        // Several lines: they're indented, blank lines and fences aside, and
+        // the selection still covers them.
+        assert_eq!(
+            run(&d, 0, "tab", code, 11, 4),
+            Action::Replace { text: "```\n    a\n\n      b\n```".into(), anchor: 4, cursor: 19 }
+        );
+        assert_eq!(
+            run(&d, 0, "tab", code, code.len(), 0),
+            Action::Replace { text: "```\n    a\n\n      b\n```".into(), anchor: 0, cursor: code.len() + 8 }
+        );
+        // A selection that ends at the start of a line leaves that line alone.
+        assert_eq!(replace(run(&d, 0, "tab", code, 4, 6)).0, "```\n    a\n\n  b\n```");
+
+        // Shift+Tab: the cursor's line, or each line of the selection.
+        let indented = "```\n      a\n\tb\nc\n```";
+        assert_eq!(replace(run(&d, 0, "backtab", indented, 10, 10)), ("```\n  a\n\tb\nc\n```".into(), 6));
+        assert_eq!(
+            run(&d, 0, "backtab", indented, 16, 6),
+            Action::Replace { text: "```\n  a\nb\nc\n```".into(), anchor: 4, cursor: 11 }
+        );
+        assert_eq!(run(&d, 0, "backtab", indented, 15, 15), Action::Swallow, "nothing to take off");
+        assert_eq!(run(&d, 0, "backtab", indented, 1, 1), Action::Swallow, "the fence stays");
+        // An indented block keeps the indentation that makes it code.
+        assert_eq!(replace(run(&d, 0, "backtab", "        a\n    b\n\t  c", 0, 19)).0, "    a\n    b\n\tc");
+        assert_eq!(replace(run(&d, 0, "tab", "    a\n    b", 0, 11)).0, "        a\n        b");
     }
 
     #[test]

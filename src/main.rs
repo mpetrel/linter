@@ -26,7 +26,28 @@ const KEEP_CURSOR: i32 = -2;
 /// say after a dialog, would come as a surprise.
 const HELD_KEY_LIFETIME: Duration = Duration::from_secs(1);
 
+/// A key held for the text field of the block being edited.
+struct HeldKey {
+    text: SharedString,
+    /// The modifiers it was pressed with: Ctrl+B is replayed as Ctrl+B even
+    /// if Ctrl is let go by then.
+    modifiers: Modifiers,
+    at: Instant,
+}
+
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "mkdn", "txt"];
+
+/// Which image blocks `refresh_images` renders again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refresh {
+    /// The ones waiting for their image.
+    Waiting,
+    /// All of them.
+    Shown,
+    /// All of them, and their rows are set even if nothing changed, so that
+    /// the ones in view ask for their image again.
+    Ping,
+}
 
 enum Pending {
     Open(Option<PathBuf>),
@@ -57,9 +78,9 @@ struct Editor {
     /// `image_width` when `rescaled` last looked.
     rendered_width: StdCell<u32>,
     /// Keys pressed while the window held the focus for the block being
-    /// edited that only its text field can handle, with when they were
-    /// pressed. They're replayed when it has the focus again.
-    held_keys: Vec<(SharedString, Instant)>,
+    /// edited that only its text field can handle, with the modifiers held
+    /// and when they were pressed. They're replayed when it has the focus again.
+    held_keys: Vec<HeldKey>,
 }
 
 impl Editor {
@@ -117,7 +138,7 @@ impl Editor {
     /// The image to show for an image block, or why there's none (yet).
     fn image(&self, url: &str, alt: &str, base: &Path) -> (slint::Image, bool, SharedString) {
         let alt = if alt.is_empty() { "image" } else { alt };
-        match self.images.get(url, base, self.image_width()) {
+        match self.images.get(url, base) {
             images::Lookup::Ready(image) => (image, true, SharedString::new()),
             images::Lookup::Loading => (slint::Image::default(), false, format!("{alt} — loading…").into()),
             images::Lookup::Failed(why) => (slint::Image::default(), false, format!("{alt} — {why}").into()),
@@ -134,17 +155,29 @@ impl Editor {
         (column * scale.max(2.0)).ceil() as u32
     }
 
-    /// Shows the images that finished loading.
-    fn images_ready(&self) {
-        let collected = self.images.collect();
-        if collected.new || collected.sharper {
-            self.refresh_images(collected.sharper);
+    /// The list shows the row of block `i` (it was just created, or its data
+    /// set): loads the image of an image block. Images load only for the
+    /// blocks in view.
+    fn want_image(&self, i: usize) {
+        let Some(block) = self.doc.blocks.get(i) else { return };
+        if let Some((url, _)) = render::render(&block.src, &self.refs).image {
+            self.images.request(&url, &self.base_dir(), self.image_width());
         }
     }
 
-    /// Renders the image blocks again that wait for their image, and with
-    /// `all` the ones that show one too.
-    fn refresh_images(&self, all: bool) {
+    /// Shows the images that finished loading, and lets go of the ones
+    /// dropped for the memory budget.
+    fn images_ready(&self) {
+        let collected = self.images.collect();
+        if collected.sharper || collected.evicted {
+            self.refresh_images(Refresh::Shown);
+        } else if collected.new {
+            self.refresh_images(Refresh::Waiting);
+        }
+    }
+
+    /// Renders the image blocks again whose image may have changed.
+    fn refresh_images(&self, which: Refresh) {
         let base = self.base_dir();
         for i in 0..self.model.row_count() {
             // The block being edited shows its image when editing ends.
@@ -152,9 +185,9 @@ impl Editor {
                 continue;
             }
             let Some(row) = self.model.row_data(i) else { continue };
-            if row.kind == BlockKind::Image && (all || !row.has_image) {
+            if row.kind == BlockKind::Image && (which != Refresh::Waiting || !row.has_image) {
                 let new = self.render_row(i, &base);
-                if new.has_image != row.has_image || new.image != row.image || new.caption != row.caption {
+                if which == Refresh::Ping || new.has_image != row.has_image || new.image != row.image || new.caption != row.caption {
                     self.model.set_row_data(i, new);
                 }
             }
@@ -163,12 +196,13 @@ impl Editor {
 
     /// Called when the window's scale may have changed: it isn't known before
     /// the window first shows, and changes on another screen. Images scaled
-    /// down to the column are decoded again if it's wider in pixels now.
+    /// down to the column are decoded again if it's wider in pixels now: the
+    /// ones in view right away, the others when they come into view.
     fn rescaled(&self) {
         let width = self.image_width();
         if width > self.rendered_width.get() {
             self.rendered_width.set(width);
-            self.refresh_images(true);
+            self.refresh_images(Refresh::Ping);
         }
     }
 
@@ -209,7 +243,7 @@ impl Editor {
     /// Cheap update while typing: only what the edit field needs for styling.
     fn update_live(&self, i: usize) {
         let src = &self.doc.blocks[i].src;
-        let (kind, level) = ui_kind(doc::classify(src));
+        let (kind, level) = ui_kind(doc::classify_with(src, &self.refs));
         if let Some(mut row) = self.model.row_data(i) {
             row.kind = kind;
             row.level = level;
@@ -369,17 +403,18 @@ impl Editor {
     /// typed at the saved caret, other keys are held for the text field, and
     /// any key but a lone modifier brings the block back into view. Returns
     /// whether the key was used.
-    fn key_away(&mut self, text: &str, command: bool) -> bool {
+    fn key_away(&mut self, text: &str, modifiers: Modifiers) -> bool {
         let Some(i) = self.editing.filter(|&i| i < self.doc.blocks.len()) else { return false };
         if is_modifier_key(text) {
             return false;
         }
         let Some(ui) = self.ui.upgrade() else { return false };
-        self.held_keys.retain(|(_, at)| at.elapsed() < HELD_KEY_LIFETIME);
+        self.held_keys.retain(|k| k.at.elapsed() < HELD_KEY_LIFETIME);
+        let command = modifiers.control || modifiers.alt || modifiers.meta;
         if !self.held_keys.is_empty() || command || !is_typed_text(text) {
             // Backspace, the arrows, Ctrl+V and so on, and anything after
             // them, so that keys keep their order.
-            self.held_keys.push((text.into(), Instant::now()));
+            self.held_keys.push(HeldKey { text: text.into(), modifiers, at: Instant::now() });
         } else {
             let src = &self.doc.blocks[i].src;
             let (caret, anchor) = if ui.get_caret_seq() == self.edit_seq {
@@ -406,19 +441,18 @@ impl Editor {
 
     /// The text field of the block being edited has the focus again: the keys
     /// held for it, but not ones so old that they'd come as a surprise.
-    fn take_held_keys(&mut self) -> Vec<SharedString> {
-        std::mem::take(&mut self.held_keys)
-            .into_iter()
-            .filter(|(_, at)| at.elapsed() < HELD_KEY_LIFETIME)
-            .map(|(text, _)| text)
-            .collect()
+    fn take_held_keys(&mut self) -> Vec<HeldKey> {
+        let mut keys = std::mem::take(&mut self.held_keys);
+        keys.retain(|k| k.at.elapsed() < HELD_KEY_LIFETIME);
+        keys
     }
 
     /// Esc while the window holds the focus for the block being edited.
     fn finish_edit(&mut self) {
-        if self.held_keys.iter().any(|(_, at)| at.elapsed() < HELD_KEY_LIFETIME) {
+        if self.held_keys.iter().any(|k| k.at.elapsed() < HELD_KEY_LIFETIME) {
             // After the keys before it.
-            self.key_away(&SharedString::from(slint::platform::Key::Escape), false);
+            let Some(ui) = self.ui.upgrade() else { return };
+            self.key_away(&SharedString::from(slint::platform::Key::Escape), ui.get_modifiers());
         } else {
             self.request_edit(None, None);
         }
@@ -433,7 +467,7 @@ impl Editor {
         if self.doc.blocks[i].src != text {
             self.edited(i, text);
         }
-        match ops::run(&self.doc, i, cmd, text, cursor, anchor) {
+        match ops::run(&self.doc, &self.refs, i, cmd, text, cursor, anchor) {
             Action::Pass => pass,
             Action::Swallow => handled,
             Action::Replace { text, anchor, cursor } => {
@@ -480,7 +514,7 @@ impl Editor {
             return;
         }
         let last = self.doc.blocks.len() - 1;
-        if doc::classify(&self.doc.blocks[last].src).is_prose() {
+        if doc::classify_with(&self.doc.blocks[last].src, &self.refs).is_prose() {
             self.request_edit(Some(last), Some(Cursor::End));
             return;
         }
@@ -671,21 +705,52 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = dir.join(format!(".{name}.{}.linter-tmp", std::process::id()));
+    let existing = std::fs::metadata(&target).ok();
+    let mut created = false;
     let result = (|| {
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = create_temp(&tmp, existing.is_some())?;
+        created = true;
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
+        // The file's own permissions, now that the temporary file holds
+        // what the file will.
         #[cfg(unix)]
-        if let Ok(meta) = std::fs::metadata(&target) {
+        if let Some(meta) = &existing {
             std::fs::set_permissions(&tmp, meta.permissions())?;
         }
         std::fs::rename(&tmp, &target)
     })();
-    if result.is_err() {
+    if result.is_err() && created {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Creates the temporary file for `write_atomic`. It's new, so that it can't
+/// be a file or link someone else put there. On Unix, when it replaces an
+/// existing file, only its owner can read it until the data is written and
+/// the file's permissions are copied: the file may be private.
+fn create_temp(tmp: &Path, replaces: bool) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A new file gets the usual permissions (the umask applies).
+        options.mode(if replaces { 0o600 } else { 0o666 });
+    }
+    #[cfg(not(unix))]
+    let _ = replaces;
+    match options.open(tmp) {
+        // Left behind by a save that crashed: replace it. Removing a link
+        // removes the link, not what it points to.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(tmp)?;
+            options.open(tmp)
+        }
+        result => result,
+    }
 }
 
 // ----- conversion to UI data -------------------------------------------------------
@@ -1019,6 +1084,23 @@ fn wire(app: &App, editor: &Rc<RefCell<Editor>>) {
             ed.images_ready();
         }
     });
+    let ed = Rc::downgrade(editor);
+    app.on_show_image(move |i| {
+        let Some(editor) = ed.upgrade() else { return };
+        if let Ok(ed) = editor.try_borrow() {
+            ed.want_image(i as usize);
+            return;
+        }
+        // The list created the row while the editor was busy: right after.
+        let ed = Rc::downgrade(&editor);
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            if let Some(ed) = ed.upgrade()
+                && let Ok(ed) = ed.try_borrow()
+            {
+                ed.want_image(i as usize);
+            }
+        });
+    });
     let ed = editor.clone();
     app.on_edited(move |i, text| ed.borrow_mut().edited(i as usize, &text));
     let ed = editor.clone();
@@ -1055,7 +1137,7 @@ fn wire(app: &App, editor: &Rc<RefCell<Editor>>) {
     let ed = editor.clone();
     app.on_finish_edit(move || ed.borrow_mut().finish_edit());
     let ed = editor.clone();
-    app.on_key_away(move |text, command| ed.borrow_mut().key_away(&text, command));
+    app.on_key_away(move |text, modifiers| ed.borrow_mut().key_away(&text, modifiers));
     let ed = editor.clone();
     let weak = app.as_weak();
     app.on_edit_focused(move || {
@@ -1067,9 +1149,7 @@ fn wire(app: &App, editor: &Rc<RefCell<Editor>>) {
         let weak = weak.clone();
         slint::Timer::single_shot(Duration::ZERO, move || {
             if let Some(ui) = weak.upgrade() {
-                for text in keys {
-                    ui.window().dispatch_event(slint::platform::WindowEvent::KeyPressed { text });
-                }
+                replay_keys(&ui, keys);
             }
         });
     });
@@ -1078,6 +1158,42 @@ fn wire(app: &App, editor: &Rc<RefCell<Editor>>) {
         let Ok(mut ed) = ed.try_borrow_mut() else { return CloseRequestResponse::KeepWindowShown };
         if ed.guard(Pending::Close) { CloseRequestResponse::HideWindow } else { CloseRequestResponse::KeepWindowShown }
     });
+}
+
+/// Plays held keys to the text field that has the focus, each with the
+/// modifiers it was pressed with, then puts back the ones held now.
+fn replay_keys(ui: &App, keys: Vec<HeldKey>) {
+    let window = ui.window();
+    let held = ui.get_modifiers();
+    let mut current = held.clone();
+    for key in keys {
+        set_modifiers(window, &current, &key.modifiers);
+        window.dispatch_event(slint::platform::WindowEvent::KeyPressed { text: key.text });
+        current = key.modifiers;
+    }
+    set_modifiers(window, &current, &held);
+}
+
+/// Makes the window see the modifiers `to` held instead of `from`, by
+/// pressing or releasing the keys. A modifier held now is released on both
+/// sides, and pressed back on the left: on release the platform reports the
+/// modifiers held, which clears it.
+fn set_modifiers(window: &slint::Window, from: &Modifiers, to: &Modifiers) {
+    use slint::platform::{Key, WindowEvent};
+    for (was, now, keys) in [
+        (from.control, to.control, &[Key::Control, Key::ControlR][..]),
+        (from.alt, to.alt, &[Key::Alt][..]),
+        (from.shift, to.shift, &[Key::Shift, Key::ShiftR][..]),
+        (from.meta, to.meta, &[Key::Meta, Key::MetaR][..]),
+    ] {
+        if now && !was {
+            window.dispatch_event(WindowEvent::KeyPressed { text: keys[0].into() });
+        } else if was && !now {
+            for &key in keys {
+                window.dispatch_event(WindowEvent::KeyReleased { text: key.into() });
+            }
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1156,6 +1272,39 @@ mod tests {
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
         assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The temporary file that replaces a file is private from the start, and
+    /// a file or link already at its path is replaced, not written through.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_temporary_file_is_private_and_new() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("atomic-private");
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = dir.join("tmp");
+        drop(create_temp(&tmp, true).unwrap());
+        assert_eq!(mode(&tmp), 0o600, "readable by others before the data is written");
+        // Left behind: it's replaced, and made private again.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(create_temp(&tmp, true).unwrap());
+        assert_eq!(mode(&tmp), 0o600);
+
+        // A link where the temporary file goes: what it points to is untouched.
+        let file = dir.join("notes.md");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let other = dir.join("other");
+        std::fs::write(&other, "other").unwrap();
+        std::os::unix::fs::symlink(&other, dir.join(format!(".notes.md.{}.linter-tmp", std::process::id()))).unwrap();
+        write_atomic(&file, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        assert_eq!(mode(&file), 0o640, "the file keeps its permissions");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "other");
+        let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        assert_eq!(names, ["notes.md", "other", "tmp"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

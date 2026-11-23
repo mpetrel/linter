@@ -2,10 +2,13 @@
 //!
 //! Images are read, downloaded and decoded on worker threads, so a document
 //! with many or large images opens at once and typing never waits for one.
-//! Until an image is ready its block shows a placeholder. Large images are
-//! scaled to what the document column can show while they're decoded, which
-//! keeps decoding fast and memory use low. Decoded images are kept until
-//! another document is opened.
+//! An image is only loaded once its block is in view, and until it's ready
+//! the block shows a placeholder. The newest requests are served first, so
+//! after a fast scroll the blocks in view load before the ones scrolled past.
+//! Large images are scaled to what the document column can show while
+//! they're decoded, which keeps decoding fast and memory use low. Decoded
+//! images are kept up to a memory budget, the ones shown longest ago going
+//! first, and until another document is opened.
 //!
 //! Decoders, chosen for speed:
 //! - JPEG: zune-jpeg (through `image`), or `jpeg-decoder` for photos at least
@@ -26,7 +29,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
 /// Largest download accepted.
@@ -37,16 +40,23 @@ const MAX_SVG: usize = 8 << 20;
 const MAX_PIXELS: u64 = 200_000_000;
 /// Longest side of a decoded image: GPUs can't hold larger textures.
 const MAX_SIDE: u32 = 16384;
-/// Downloads at a time, as browsers allow per host.
+/// Decoded images kept, in bytes: some 40 photos at the column's width.
+const BUDGET: usize = 256 << 20;
+/// Downloads at a time for the open document, as browsers allow per host.
 const DOWNLOADS: usize = 6;
+/// A worker that has had nothing to do for this long ends.
+const IDLE_EXIT: Duration = Duration::from_secs(30);
 /// How often finished images are collected while some are loading.
 const POLL: Duration = Duration::from_millis(16);
 /// AVIF is left out, so that servers that pick a format by this header
 /// don't send it.
 const ACCEPT: &str = "image/webp,image/png,image/jpeg,image/gif,image/svg+xml,image/*;q=0.8,*/*;q=0.5";
+/// Why a load for a document that was closed stopped.
+const CLOSED: &str = "the document was closed";
 
 pub enum Lookup {
     Ready(slint::Image),
+    /// Loading, or not asked for yet.
     Loading,
     Failed(String),
 }
@@ -67,14 +77,24 @@ impl Key {
     }
 }
 
+/// `used` is when the image was last asked for, for the memory budget.
 enum Entry {
-    Loading,
+    Loading { used: u64 },
     /// Decoded for at most `width` pixels wide; `scaled` if it was scaled
-    /// down to that.
-    Ready { image: slint::Image, width: u32, scaled: bool },
+    /// down to that. `bytes` is the memory it takes.
+    Ready { image: slint::Image, width: u32, scaled: bool, bytes: usize, used: u64 },
     /// Being decoded again, wider: shown as it is meanwhile.
-    Widening(slint::Image),
+    Widening { image: slint::Image, bytes: usize, used: u64 },
     Failed(String),
+}
+
+impl Entry {
+    fn touch(&mut self, now: u64) {
+        match self {
+            Entry::Loading { used } | Entry::Ready { used, .. } | Entry::Widening { used, .. } => *used = now,
+            Entry::Failed(_) => {}
+        }
+    }
 }
 
 struct Job {
@@ -90,13 +110,16 @@ struct Done {
     result: Result<Decoded, String>,
 }
 
-/// What `Images::collect` moved into the cache.
+/// What `Images::collect` changed in the cache.
 #[derive(Default)]
 pub struct Collected {
     /// Images, or why they failed, for blocks that waited for them.
     pub new: bool,
     /// Sharper copies of images already shown.
     pub sharper: bool,
+    /// Images dropped for the memory budget: the blocks that show them
+    /// should let go of them too.
+    pub evicted: bool,
 }
 
 /// Decoded image data, which unlike `slint::Image` can be sent between threads.
@@ -109,49 +132,85 @@ pub enum Decoded {
 }
 
 impl Decoded {
-    /// The image, and whether it was scaled down to `max_width`, the width it
-    /// was decoded for.
-    fn into_image(self, max_width: u32) -> Result<(slint::Image, bool), String> {
+    /// The image, whether it was scaled down to `max_width`, the width it
+    /// was decoded for, and about how much memory it takes.
+    fn into_image(self, max_width: u32) -> Result<(slint::Image, bool, usize), String> {
+        let pixels = |w: u32, h: u32| w as usize * h as usize;
         Ok(match self {
             Decoded::Rgb(b) => {
-                let scaled = b.width() >= max_width;
-                (slint::Image::from_rgb8(b), scaled)
+                let (scaled, bytes) = (b.width() >= max_width, pixels(b.width(), b.height()) * 3);
+                (slint::Image::from_rgb8(b), scaled, bytes)
             }
             Decoded::Rgba(b) => {
-                let scaled = b.width() >= max_width;
-                (slint::Image::from_rgba8(b), scaled)
+                let (scaled, bytes) = (b.width() >= max_width, pixels(b.width(), b.height()) * 4);
+                (slint::Image::from_rgba8(b), scaled, bytes)
             }
-            // Rendered at the size it's shown at.
-            Decoded::Svg(data) => (slint::Image::load_from_svg_data(&data).map_err(|_| "not a valid SVG image".to_owned())?, false),
+            // Rendered at the size it's shown at, at most `max_width` wide.
+            Decoded::Svg(data) => {
+                let image = slint::Image::load_from_svg_data(&data).map_err(|_| "not a valid SVG image".to_owned())?;
+                let size = image.size();
+                let w = size.width.clamp(1, max_width);
+                let h = (size.height as u64 * w as u64 / size.width.max(1) as u64).min(MAX_SIDE as u64) as u32;
+                (image, false, data.len() + pixels(w, h) * 4)
+            }
         })
+    }
+}
+
+/// What the UI thread and the workers share.
+#[derive(Default)]
+struct Shared {
+    /// Changes when the document does; images of an older one are dropped.
+    generation: AtomicU64,
+    done: Mutex<Vec<Done>>,
+}
+
+impl Shared {
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::Relaxed) == generation
     }
 }
 
 /// The images of the open document. Lives on the UI thread.
 pub struct Images {
     cache: RefCell<HashMap<Key, Entry>>,
-    /// Changes when the document does; workers drop jobs of an older one.
-    generation: Arc<AtomicU64>,
-    done: Arc<Mutex<Vec<Done>>>,
+    /// Memory taken by the images in `cache`.
+    bytes: Cell<usize>,
+    budget: usize,
+    /// Counts requests, to tell which image was asked for longest ago.
+    clock: Cell<u64>,
+    shared: Arc<Shared>,
     loading: Cell<usize>,
-    files: OnceCell<mpsc::Sender<Job>>,
-    downloads: OnceCell<mpsc::Sender<Job>>,
+    files: OnceCell<Arc<Pool>>,
+    downloads: OnceCell<Arc<Pool>>,
     timer: slint::Timer,
     on_ready: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
 impl Images {
     pub fn new() -> Self {
+        Self::with_budget(BUDGET)
+    }
+
+    pub(crate) fn with_budget(budget: usize) -> Self {
         Images {
             cache: RefCell::default(),
-            generation: Arc::default(),
-            done: Arc::default(),
+            bytes: Cell::new(0),
+            budget,
+            clock: Cell::new(0),
+            shared: Arc::default(),
             loading: Cell::new(0),
             files: OnceCell::new(),
             downloads: OnceCell::new(),
             timer: slint::Timer::default(),
             on_ready: RefCell::default(),
         }
+    }
+
+    /// How many images were asked for, loaded or not.
+    #[cfg(test)]
+    pub fn requested(&self) -> usize {
+        self.cache.borrow().len()
     }
 
     /// Called while images are loading, when some may have arrived; it should
@@ -161,53 +220,66 @@ impl Images {
         self.poll();
     }
 
-    /// The image for `url`, relative to `base`, at most `max_width` pixels
-    /// wide. Starts loading it the first time.
-    pub fn get(&self, url: &str, base: &Path, max_width: u32) -> Lookup {
+    /// The image for `url`, relative to `base`, if it's ready. Doesn't load
+    /// it: see `request`.
+    pub fn get(&self, url: &str, base: &Path) -> Lookup {
         let key = match resolve(url, base) {
             Ok(key) => key,
             Err(why) => return Lookup::Failed(why),
         };
+        match self.cache.borrow().get(&key) {
+            Some(Entry::Ready { image, .. } | Entry::Widening { image, .. }) => Lookup::Ready(image.clone()),
+            Some(Entry::Failed(why)) => Lookup::Failed(why.clone()),
+            Some(Entry::Loading { .. }) | None => Lookup::Loading,
+        }
+    }
+
+    /// The block showing `url` is in view: loads its image, at most
+    /// `max_width` pixels wide, unless it's loaded or loading. One that was
+    /// scaled down to a narrower width is decoded again (the window is on a
+    /// screen with a larger scale now) and shown as it is meanwhile.
+    pub fn request(&self, url: &str, base: &Path, max_width: u32) {
+        let Ok(key) = resolve(url, base) else { return };
+        let now = self.clock.get() + 1;
+        self.clock.set(now);
         let mut cache = self.cache.borrow_mut();
-        match cache.get(&key) {
-            Some(Entry::Loading) => return Lookup::Loading,
-            Some(Entry::Failed(why)) => return Lookup::Failed(why.clone()),
-            Some(Entry::Widening(image)) => return Lookup::Ready(image.clone()),
-            Some(Entry::Ready { image, width, scaled }) => {
-                let image = image.clone();
-                // Shown wider than it was decoded for (the window is on a
-                // screen with a larger scale now): decode it again.
-                if *scaled && max_width > *width && self.start(key.clone(), max_width) {
-                    cache.insert(key, Entry::Widening(image.clone()));
-                }
-                return Lookup::Ready(image);
+        let entry = match cache.get_mut(&key) {
+            Some(Entry::Ready { image, width, scaled: true, bytes, .. }) if max_width > *width => {
+                Entry::Widening { image: image.clone(), bytes: *bytes, used: now }
             }
-            None => {}
-        }
-        if !self.start(key.clone(), max_width) {
-            let why = "can't start loading images".to_owned();
-            cache.insert(key, Entry::Failed(why.clone()));
-            return Lookup::Failed(why);
-        }
-        cache.insert(key, Entry::Loading);
-        Lookup::Loading
+            Some(entry) => {
+                entry.touch(now);
+                return;
+            }
+            None => Entry::Loading { used: now },
+        };
+        let entry = if self.start(key.clone(), max_width) {
+            entry
+        } else {
+            match entry {
+                // Keep showing it.
+                Entry::Widening { image, bytes, used } => Entry::Ready { image, width: max_width, scaled: false, bytes, used },
+                _ => Entry::Failed("can't start loading images".into()),
+            }
+        };
+        cache.insert(key, entry);
     }
 
     /// Queues loading `key`. Returns false if there's no thread to load it.
     fn start(&self, key: Key, max_width: u32) -> bool {
         let remote = matches!(key, Key::Url(_));
-        let job = Job { generation: self.generation.load(Ordering::Relaxed), key, max_width };
+        let job = Job { generation: self.shared.generation.load(Ordering::Relaxed), key, max_width };
         let pool = if remote { &self.downloads } else { &self.files };
-        let sender = pool.get_or_init(|| {
+        let pool = pool.get_or_init(|| {
             let threads = if remote {
                 DOWNLOADS
             } else {
                 // Leave a core for the UI.
                 std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1)).clamp(1, 8)
             };
-            spawn_pool(threads, remote, self.generation.clone(), self.done.clone())
+            Pool::new(threads, remote)
         });
-        if sender.send(job).is_err() {
+        if !pool.push(job, &self.shared) {
             return false;
         }
         self.loading.set(self.loading.get() + 1);
@@ -215,33 +287,62 @@ impl Images {
         true
     }
 
-    /// Moves the images that arrived into the cache.
+    /// Moves the images that arrived into the cache, then keeps it within
+    /// the memory budget.
     pub fn collect(&self) -> Collected {
-        let done = std::mem::take(&mut *self.done.lock().unwrap());
-        let generation = self.generation.load(Ordering::Relaxed);
+        let done = std::mem::take(&mut *self.shared.done.lock().unwrap());
         let mut collected = Collected::default();
         let mut cache = self.cache.borrow_mut();
-        for d in done.into_iter().filter(|d| d.generation == generation) {
-            let widening = match cache.remove(&d.key) {
-                Some(Entry::Widening(image)) => Some(image),
-                _ => None,
+        let mut bytes = self.bytes.get();
+        for d in done.into_iter().filter(|d| self.shared.is_current(d.generation)) {
+            self.loading.set(self.loading.get().saturating_sub(1));
+            let (widening, used) = match cache.remove(&d.key) {
+                Some(Entry::Widening { image, bytes: old, used }) => {
+                    bytes -= old;
+                    (Some((image, old)), used)
+                }
+                Some(Entry::Ready { bytes: old, used, .. }) => {
+                    bytes -= old;
+                    (None, used)
+                }
+                Some(Entry::Loading { used }) => (None, used),
+                Some(Entry::Failed(_)) | None => (None, self.clock.get()),
             };
             let entry = match (d.result.and_then(|decoded| decoded.into_image(d.max_width)), widening) {
-                (Ok((image, scaled)), widening) => {
+                (Ok((image, scaled, size)), widening) => {
                     collected.sharper |= widening.is_some();
                     collected.new |= widening.is_none();
-                    Entry::Ready { image, width: d.max_width, scaled }
+                    bytes += size;
+                    Entry::Ready { image, width: d.max_width, scaled, bytes: size, used }
                 }
                 // Keep showing the image it already has, and don't try again.
-                (Err(_), Some(image)) => Entry::Ready { image, width: d.max_width, scaled: false },
+                (Err(_), Some((image, old))) => {
+                    bytes += old;
+                    Entry::Ready { image, width: d.max_width, scaled: false, bytes: old, used }
+                }
                 (Err(why), None) => {
                     collected.new = true;
                     Entry::Failed(why)
                 }
             };
             cache.insert(d.key, entry);
-            self.loading.set(self.loading.get().saturating_sub(1));
         }
+        // The images asked for longest ago go first, but not the last one.
+        while bytes > self.budget {
+            let ready = cache.iter().filter_map(|(key, e)| match e {
+                Entry::Ready { used, bytes, .. } => Some((*used, *bytes, key)),
+                _ => None,
+            });
+            let (count, oldest) = ready.fold((0, None), |(n, oldest), r| {
+                (n + 1, if oldest.is_none_or(|o: (u64, usize, &Key)| r.0 < o.0) { Some(r) } else { oldest })
+            });
+            let Some((_, size, key)) = oldest.filter(|_| count > 1) else { break };
+            let key = key.clone();
+            cache.remove(&key);
+            bytes -= size;
+            collected.evicted = true;
+        }
+        self.bytes.set(bytes);
         if self.loading.get() == 0 {
             self.timer.stop();
         }
@@ -249,12 +350,16 @@ impl Images {
     }
 
     /// Forgets all images, for another document. Images still loading are
-    /// dropped when they arrive.
+    /// dropped when they arrive, and don't hold up the new document's.
     pub fn clear(&self) {
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        let generation = self.shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        for pool in [self.files.get(), self.downloads.get()].into_iter().flatten() {
+            pool.clear(generation);
+        }
         // After the generation changes, so that workers add no more of them.
-        self.done.lock().unwrap().clear();
+        self.shared.done.lock().unwrap().clear();
         self.cache.borrow_mut().clear();
+        self.bytes.set(0);
         self.loading.set(0);
         self.timer.stop();
     }
@@ -269,36 +374,128 @@ impl Images {
     }
 }
 
-fn spawn_pool(threads: usize, remote: bool, generation: Arc<AtomicU64>, done: Arc<Mutex<Vec<Done>>>) -> mpsc::Sender<Job> {
-    let (tx, rx) = mpsc::channel::<Job>();
-    let rx = Arc::new(Mutex::new(rx));
-    let agent = remote.then(agent);
-    for i in 0..threads {
-        let (rx, generation, done, agent) = (rx.clone(), generation.clone(), done.clone(), agent.clone());
-        let name = format!("{}-{i}", if remote { "download" } else { "image" });
-        let spawned = std::thread::Builder::new().name(name).spawn(move || {
-            loop {
-                let Ok(job) = rx.lock().unwrap().recv() else { return };
-                if job.generation != generation.load(Ordering::Relaxed) {
-                    continue;
+impl Drop for Images {
+    fn drop(&mut self) {
+        for pool in [self.files.get(), self.downloads.get()].into_iter().flatten() {
+            pool.close();
+        }
+    }
+}
+
+/// Worker threads that load images, the newest request first. They're
+/// started as needed, up to `limit` for the open document: workers still
+/// busy with an image of a document that was closed, such as a download
+/// that hangs, don't count, so they don't hold up the next document.
+struct Pool {
+    queue: Mutex<Queue>,
+    work: Condvar,
+    limit: usize,
+    remote: bool,
+    agent: Option<ureq::Agent>,
+}
+
+#[derive(Default)]
+struct Queue {
+    /// Newest last.
+    jobs: Vec<Job>,
+    /// The open document's generation.
+    generation: u64,
+    /// Workers waiting for a job.
+    idle: usize,
+    /// Workers loading an image for the open document.
+    busy: usize,
+    threads: usize,
+    closed: bool,
+}
+
+impl Pool {
+    fn new(limit: usize, remote: bool) -> Arc<Pool> {
+        Arc::new(Pool { queue: Mutex::default(), work: Condvar::new(), limit, remote, agent: remote.then(agent) })
+    }
+
+    /// Queues `job`, and starts a worker for it if there's none free and
+    /// room for one. Returns false if there's no worker to run it.
+    fn push(self: &Arc<Self>, job: Job, shared: &Arc<Shared>) -> bool {
+        let mut q = self.queue.lock().unwrap();
+        q.jobs.push(job);
+        // Workers busy with another document's images, up to as many again
+        // as the limit (three documents opened while their downloads hang)
+        // before new jobs wait for them.
+        if q.jobs.len() > q.idle && q.idle + q.busy < self.limit && q.threads < self.limit * 4 {
+            let (pool, shared) = (self.clone(), shared.clone());
+            let name = format!("{}-{}", if self.remote { "download" } else { "image" }, q.threads);
+            match std::thread::Builder::new().name(name).spawn(move || pool.run(&shared)) {
+                Ok(_) => {
+                    q.idle += 1;
+                    q.threads += 1;
                 }
-                // A decoder bug on a bad file shouldn't leave the image loading forever.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&job.key, job.max_width, agent.as_ref())))
-                    .unwrap_or_else(|_| Err(format!("{}: the decoder failed", job.key.name())));
+                Err(_) if q.threads == 0 => {
+                    q.jobs.pop();
+                    return false;
+                }
+                Err(_) => {}
+            }
+        }
+        self.work.notify_one();
+        true
+    }
+
+    /// Another document: drops the jobs of the old one, and frees the places
+    /// of the workers busy with its images.
+    fn clear(&self, generation: u64) {
+        let mut q = self.queue.lock().unwrap();
+        q.jobs.clear();
+        q.generation = generation;
+        q.busy = 0;
+    }
+
+    /// Ends the workers, once they finish what they're doing.
+    fn close(&self) {
+        let mut q = self.queue.lock().unwrap();
+        q.closed = true;
+        q.jobs.clear();
+        self.work.notify_all();
+    }
+
+    /// A worker. It's counted as idle when started.
+    fn run(&self, shared: &Shared) {
+        let mut q = self.queue.lock().unwrap();
+        loop {
+            if q.closed {
+                break;
+            }
+            let Some(job) = q.jobs.pop() else {
+                let (guard, wait) = self.work.wait_timeout(q, IDLE_EXIT).unwrap();
+                q = guard;
+                if wait.timed_out() && q.jobs.is_empty() {
+                    break;
+                }
+                continue;
+            };
+            q.idle -= 1;
+            q.busy += 1;
+            drop(q);
+            let stale = || !shared.is_current(job.generation);
+            // A decoder bug on a bad file shouldn't leave the image loading forever.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&job.key, job.max_width, self.agent.as_ref(), &stale)))
+                .unwrap_or_else(|_| Err(format!("{}: the decoder failed", job.key.name())));
+            {
                 // The document may have changed meanwhile: then `clear` has
                 // emptied `done`, and nothing would take the image out again.
-                let mut done = done.lock().unwrap();
-                if job.generation == generation.load(Ordering::Relaxed) {
+                let mut done = shared.done.lock().unwrap();
+                if shared.is_current(job.generation) {
                     done.push(Done { generation: job.generation, key: job.key, max_width: job.max_width, result });
                 }
             }
-        });
-        if spawned.is_err() && i == 0 {
-            // No thread to run the jobs: dropping `rx` makes `send` fail.
-            break;
+            q = self.queue.lock().unwrap();
+            if q.generation == job.generation {
+                q.busy -= 1;
+            }
+            q.idle += 1;
         }
+        q.idle -= 1;
+        q.threads -= 1;
     }
-    tx
 }
 
 /// Turns an image URL from the document into a cache key.
@@ -339,8 +536,11 @@ fn file_url_path(rest: &str) -> Option<String> {
     cfg!(windows).then(|| format!("//{rest}"))
 }
 
-/// Runs on a worker thread.
-fn load(key: &Key, max_width: u32, agent: Option<&ureq::Agent>) -> Result<Decoded, String> {
+/// Runs on a worker thread. Gives up once `stale` says the document was closed.
+fn load(key: &Key, max_width: u32, agent: Option<&ureq::Agent>, stale: &dyn Fn() -> bool) -> Result<Decoded, String> {
+    if stale() {
+        return Err(CLOSED.into());
+    }
     let (bytes, ext) = match key {
         Key::File { path, .. } => {
             let bytes = std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
@@ -348,7 +548,7 @@ fn load(key: &Key, max_width: u32, agent: Option<&ureq::Agent>) -> Result<Decode
         }
         Key::Url(url) => {
             let agent = agent.ok_or("no downloader")?;
-            let (bytes, content_type) = fetch(agent, url).map_err(|why| format!("can't download {url}: {why}"))?;
+            let (bytes, content_type) = fetch(agent, url, stale).map_err(|why| format!("can't download {url}: {why}"))?;
             let ext = match content_type.as_deref() {
                 Some(t) if t.starts_with("image/svg") => Some("svg".to_owned()),
                 _ => url_extension(url),
@@ -356,6 +556,9 @@ fn load(key: &Key, max_width: u32, agent: Option<&ureq::Agent>) -> Result<Decode
             (bytes, ext)
         }
     };
+    if stale() {
+        return Err(CLOSED.into());
+    }
     decode(&bytes, ext.as_deref(), max_width).map_err(|why| format!("{}: {why}", key.name()))
 }
 
@@ -382,8 +585,10 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-/// The body and content type of `url`.
-fn fetch(agent: &ureq::Agent, url: &str) -> Result<(Vec<u8>, Option<String>), String> {
+/// The body and content type of `url`. Stops reading once `stale` says the
+/// document was closed.
+fn fetch(agent: &ureq::Agent, url: &str, stale: &dyn Fn() -> bool) -> Result<(Vec<u8>, Option<String>), String> {
+    use std::io::Read;
     let mut request = agent.get(url).header("Accept", ACCEPT);
     // A proxy can't reach this machine's own servers, so browsers bypass it
     // for them; ureq only does if NO_PROXY says so.
@@ -396,8 +601,19 @@ fn fetch(agent: &ureq::Agent, url: &str) -> Result<(Vec<u8>, Option<String>), St
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.to_ascii_lowercase());
-    let bytes = response.body_mut().with_config().limit(MAX_DOWNLOAD).read_to_vec().map_err(|e| describe(&e))?;
-    Ok((bytes, content_type))
+    let mut body = response.body_mut().with_config().limit(MAX_DOWNLOAD).reader();
+    let (mut bytes, mut chunk) = (Vec::new(), vec![0; 64 << 10]);
+    loop {
+        if stale() {
+            return Err(CLOSED.into());
+        }
+        match body.read(&mut chunk) {
+            Ok(0) => return Ok((bytes, content_type)),
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(describe(&ureq::Error::from(e))),
+        }
+    }
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -894,7 +1110,7 @@ pub(crate) mod tests {
             (200, "image/svg+xml", svg),
         ]);
         let agent = agent();
-        let get = |path: &str| load(&Key::Url(format!("{base}{path}")), 1640, Some(&agent));
+        let get = |path: &str| load(&Key::Url(format!("{base}{path}")), 1640, Some(&agent), &|| false);
         assert_eq!(size(&get("/a.png").unwrap()), (40, 30));
         assert!(get("/b.png").unwrap_err().ends_with("/b.png: the server answered 404 Not Found"));
         assert!(get("/c.png").unwrap_err().ends_with("/c.png: not an image (got a web page)"));
@@ -939,30 +1155,102 @@ pub(crate) mod tests {
             Lookup::Failed(why) => panic!("{why}"),
         };
 
-        assert!(matches!(images.get("wide.png", &dir, 100), Lookup::Loading));
-        assert!(matches!(images.get("small.png", &dir, 100), Lookup::Loading));
+        // Nothing loads until it's asked for.
+        assert!(matches!(images.get("wide.png", &dir), Lookup::Loading));
+        assert_eq!(images.loading.get(), 0);
+        images.request("wide.png", &dir, 100);
+        images.request("small.png", &dir, 100);
+        images.request("wide.png", &dir, 100);
+        assert_eq!(images.loading.get(), 2, "asked for again while loading");
         let c = wait(&images);
         assert!(c.new && !c.sharper);
-        assert_eq!(width(images.get("wide.png", &dir, 100)), 100, "scaled down to fit");
-        assert_eq!(width(images.get("small.png", &dir, 100)), 40);
+        assert_eq!(width(images.get("wide.png", &dir)), 100, "scaled down to fit");
+        assert_eq!(width(images.get("small.png", &dir)), 40);
 
         // Wider now: the scaled image is decoded again, and shown meanwhile;
         // the small one is left as it is.
-        assert_eq!(width(images.get("wide.png", &dir, 200)), 100);
-        assert_eq!(width(images.get("small.png", &dir, 200)), 40);
+        images.request("wide.png", &dir, 200);
+        images.request("small.png", &dir, 200);
+        assert_eq!(width(images.get("wide.png", &dir)), 100);
         assert_eq!(images.loading.get(), 1);
         let c = wait(&images);
         assert!(c.sharper && !c.new);
-        assert_eq!(width(images.get("wide.png", &dir, 200)), 200);
-        assert_eq!(width(images.get("wide.png", &dir, 100)), 200, "narrower doesn't decode it again");
-        assert_eq!(images.loading.get(), 0);
+        assert_eq!(width(images.get("wide.png", &dir)), 200);
+        images.request("wide.png", &dir, 100);
+        assert_eq!(images.loading.get(), 0, "narrower doesn't decode it again");
+        assert_eq!(images.bytes.get(), 200 * 50 * 3 + 40 * 10 * 3);
 
         // Another document: images still loading are dropped.
         std::fs::write(dir.join("wide.png"), encode(&DynamicImage::ImageRgb8(gradient(401, 100)), ImageFormat::Png)).unwrap();
-        assert!(matches!(images.get("wide.png", &dir, 100), Lookup::Loading));
+        images.request("wide.png", &dir, 100);
         images.clear();
         std::thread::sleep(Duration::from_millis(200));
-        assert!(images.done.lock().unwrap().is_empty(), "the stale image isn't kept");
+        assert!(images.shared.done.lock().unwrap().is_empty(), "the stale image isn't kept");
+        assert_eq!(images.bytes.get(), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_budget_drops_the_images_asked_for_longest_ago() {
+        let dir = std::env::temp_dir().join(format!("linter-images-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.png", "b.png", "c.png"] {
+            std::fs::write(dir.join(name), encode(&DynamicImage::ImageRgb8(gradient(100, 100)), ImageFormat::Png)).unwrap();
+        }
+        let ready = |images: &Images, name: &str| matches!(images.get(name, &dir), Lookup::Ready(_));
+        // Room for two of them.
+        let images = Images::with_budget(70_000);
+        images.request("a.png", &dir, 1640);
+        images.request("b.png", &dir, 1640);
+        assert!(!wait(&images).evicted);
+        images.request("a.png", &dir, 1640); // shown again: b is now the oldest
+        images.request("c.png", &dir, 1640);
+        assert!(wait(&images).evicted);
+        assert!(ready(&images, "a.png") && ready(&images, "c.png"));
+        assert!(!ready(&images, "b.png"));
+        assert_eq!(images.bytes.get(), 60_000);
+        // Asked for again, it loads again.
+        images.request("b.png", &dir, 1640);
+        assert!(wait(&images).evicted);
+        assert!(ready(&images, "b.png") && ready(&images, "c.png") && !ready(&images, "a.png"));
+
+        // An image larger than the budget is still kept, on its own.
+        let images = Images::with_budget(1000);
+        images.request("a.png", &dir, 1640);
+        images.request("b.png", &dir, 1640);
+        wait(&images);
+        assert_eq!(["a.png", "b.png"].iter().filter(|n| ready(&images, n)).count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn downloads_of_a_closed_document_dont_hold_up_the_next() {
+        // A server that takes connections and never answers.
+        let hang = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let slow = format!("http://{}", hang.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let held: Vec<_> = hang.incoming().collect();
+            drop(held);
+        });
+        let images = Images::new();
+        let base = Path::new(".");
+        for i in 0..DOWNLOADS * 2 {
+            images.request(&format!("{slow}/{i}.png"), base, 1640);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(images.downloads.get().unwrap().queue.lock().unwrap().busy, DOWNLOADS);
+
+        // Another document: its image comes at once, while the old downloads hang.
+        images.clear();
+        let png = encode(&DynamicImage::ImageRgb8(gradient(40, 30)), ImageFormat::Png);
+        let url = format!("{}/a.png", serve(vec![(200, "image/png", png)]));
+        let start = std::time::Instant::now();
+        images.request(&url, base, 1640);
+        wait(&images);
+        assert!(matches!(images.get(&url, base), Lookup::Ready(_)));
+        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+        let pool = images.downloads.get().unwrap().queue.lock().unwrap();
+        assert!(pool.jobs.is_empty() && pool.busy == 0);
+        assert!(pool.threads <= DOWNLOADS * 2, "{} threads", pool.threads);
     }
 }
