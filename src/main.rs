@@ -1050,27 +1050,110 @@ fn settings_path() -> Option<PathBuf> {
     base.map(|b| b.join(SETTINGS_DIR).join("settings"))
 }
 
-fn read_setting(path: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+/// The settings file's `key=value` entries, in order.
+fn read_settings(path: &Path) -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
     text.lines()
         .filter_map(|l| l.split_once('='))
-        .find(|(k, _)| k.trim() == key)
-        .map(|(_, v)| v.trim().to_owned())
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .collect()
+}
+
+#[cfg(test)]
+fn read_setting(path: &Path, key: &str) -> Option<String> {
+    read_settings(path).into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
 /// Sets `key` in the settings file, keeping the other lines.
 fn write_setting(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+    update_settings(path, |k| k == key, &[(key.to_owned(), value.to_owned())])
+}
+
+/// Replaces the settings whose key `replaced` says, with `entries` at the
+/// end, keeping the other lines.
+fn update_settings(path: &Path, replaced: impl Fn(&str) -> bool, entries: &[(String, String)]) -> std::io::Result<()> {
     let old = std::fs::read_to_string(path).unwrap_or_default();
     let mut text: String = old
         .lines()
-        .filter(|l| l.split_once('=').is_none_or(|(k, _)| k.trim() != key))
+        .filter(|l| l.split_once('=').is_none_or(|(k, _)| !replaced(k.trim())))
         .map(|l| format!("{l}\n"))
         .collect();
-    text.push_str(&format!("{key}={value}\n"));
+    for (key, value) in entries {
+        text.push_str(&format!("{key}={value}\n"));
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     write_atomic(path, text.as_bytes())
+}
+
+/// The Settings dialog, for the Referers sent with web images (see
+/// `images::Referers`): it shows the `referer.<domain>` lines of the
+/// settings file as it is when the dialog opens, and saves them back.
+fn wire_settings(app: &App, editor: &Rc<RefCell<Editor>>, settings: Option<PathBuf>) {
+    let rules = Rc::new(VecModel::<RefererRule>::default());
+    app.set_referer_rules(ModelRc::from(rules.clone()));
+    app.set_settings_path(settings.as_deref().map(|p| p.display().to_string()).unwrap_or_default().into());
+
+    let (weak, ed, model, path) = (app.as_weak(), editor.clone(), rules.clone(), settings.clone());
+    app.on_open_settings(move || {
+        let Some(app) = weak.upgrade() else { return };
+        // Stop editing: Tab moves the focus between the dialog's fields, and
+        // shouldn't move it to the block behind it.
+        if let Ok(mut ed) = ed.try_borrow_mut() {
+            ed.click_blank();
+        }
+        let entries = path.as_deref().map(read_settings).unwrap_or_default();
+        let rows = entries.into_iter().filter_map(|(key, referer)| {
+            Some(RefererRule { domain: key.strip_prefix("referer.")?.into(), referer: referer.into() })
+        });
+        app.set_focus_rule(-1);
+        model.set_vec(rows.collect::<Vec<_>>());
+        app.set_settings_error(SharedString::new());
+        app.set_settings_open(true);
+    });
+
+    let (weak, model) = (app.as_weak(), rules.clone());
+    app.on_add_referer_rule(move || {
+        let Some(app) = weak.upgrade() else { return };
+        // Before the row is created: its domain field takes the focus then.
+        app.set_focus_rule(model.row_count() as i32);
+        model.push(RefererRule::default());
+    });
+
+    let model = rules.clone();
+    app.on_remove_referer_rule(move |i| {
+        if (0..model.row_count() as i32).contains(&i) {
+            model.remove(i as usize);
+        }
+    });
+
+    let (weak, ed, model) = (app.as_weak(), editor.clone(), rules);
+    app.on_save_settings(move || {
+        let Some(app) = weak.upgrade() else { return };
+        let rows: Vec<_> = model.iter().map(|r| (r.domain.to_string(), r.referer.to_string())).collect();
+        let rules = match images::Referers::check(&rows) {
+            Ok(rules) => rules,
+            Err(why) => {
+                app.set_settings_error(why.into());
+                return;
+            }
+        };
+        if let Some(path) = &settings {
+            let entries: Vec<_> = rules.iter().map(|(domain, referer)| (format!("referer.{domain}"), referer.clone())).collect();
+            if let Err(e) = update_settings(path, |key| key.starts_with("referer."), &entries) {
+                app.set_settings_error(format!("Can't save the settings to {}: {e}", path.display()).into());
+                return;
+            }
+        }
+        app.set_settings_open(false);
+        let Ok(ed) = ed.try_borrow() else { return };
+        ed.images.set_referers(images::Referers::new(rules.iter().map(|(d, r)| (d.as_str(), r.as_str()))));
+        // Images refused before may come with the new Referers.
+        ed.images.forget_failed_downloads();
+        ed.refresh_images(Refresh::Waiting);
+        ed.set_status("Settings saved", false);
+    });
 }
 
 fn wire(app: &App, editor: &Rc<RefCell<Editor>>) {
@@ -1205,7 +1288,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let settings = settings_path();
-    let dark = settings.as_deref().and_then(|p| read_setting(p, "theme")).is_some_and(|t| t == "dark");
+    let entries = settings.as_deref().map(read_settings).unwrap_or_default();
+    let dark = entries.iter().find(|(k, _)| k == "theme").is_some_and(|(_, v)| v == "dark");
     apply_theme(&app, dark);
     // The window frame can only be themed once the window exists.
     let window = app.as_weak();
@@ -1217,13 +1301,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let editor = Rc::new(RefCell::new(Editor::new(&app)));
+    let referers = images::Referers::from_settings(entries.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    editor.borrow().images.set_referers(referers);
     match std::env::args_os().nth(1) {
         Some(path) => editor.borrow_mut().load(PathBuf::from(path)),
         None => editor.borrow_mut().start_blank(),
     }
 
     wire(&app, &editor);
-    wire_theme(&app, settings);
+    wire_theme(&app, settings.clone());
+    wire_settings(&app, &editor, settings);
     install_window_events(&app, editor.clone());
 
     app.run()?;
@@ -1322,6 +1409,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "other = 1\n# note\ntheme=light\n");
         assert_eq!(read_setting(&file, "theme").as_deref(), Some("light"));
         assert_eq!(read_setting(&file, "other").as_deref(), Some("1"));
+        let entries = [("other", "1"), ("theme", "light")].map(|(k, v)| (k.to_owned(), v.to_owned()));
+        assert_eq!(read_settings(&file), entries);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

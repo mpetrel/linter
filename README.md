@@ -45,9 +45,11 @@ document rendered. When nothing is being edited, a click below the last block co
 writing at the end.
 
 The *Theme* menu at the right of the toolbar switches between the light and dark theme.
-The choice is remembered in `~/.config/linter/settings` (`%APPDATA%\linter\settings` on
-Windows, `~/Library/Application Support/linter/settings` on macOS). *About* shows the
-version and the Slint attribution.
+*Settings…* gives the Referer sent with the web images of some sites (see
+[Images](#images)). Both are kept in `~/.config/linter/settings`
+(`%APPDATA%\linter\settings` on Windows, `~/Library/Application Support/linter/settings`
+on macOS), a text file of `key=value` lines. *About* shows the version and the Slint
+attribution.
 
 ## Files
 
@@ -111,6 +113,25 @@ anywhere in the file) is shown in place of the block:
   system's certificates. The proxy comes from `HTTPS_PROXY` / `ALL_PROXY` or, on Windows,
   the system proxy setting; images from this machine (`localhost`, `127.0.0.1`) bypass
   it. Downloads aren't kept on disk: opening the file again downloads them again.
+- **Sites that serve images only to their own pages** (hotlink protection) turn away
+  requests without a `Referer`, as linter sends, like a browser for a file it opened. An
+  image refused this way (`403 Forbidden`) is asked for once more with its own site as the
+  Referer (`https://cdn.example.com/` for `https://cdn.example.com/a/b.png`), which most
+  let through and which tells the server nothing it doesn't know. For a site that wants
+  another page, add its domain in *Settings…* with the Referer to send (*Add Site*;
+  × removes one). It's sent with every image of that domain and its subdomains; the
+  longest domain that matches wins. The domain can be pasted as an image's URL, and a
+  Referer without `https://` is a host name (and path): `www.example.org` stands for
+  `https://www.example.org/`. Saving applies the rules at once, and the images refused
+  before are asked for again. An image still refused says which Referers were tried. In
+  the settings file the rules are one line each. They can be edited by hand too; *Settings…*
+  shows the file as it is when it opens, and hand edits apply when linter starts or once
+  saved from there:
+
+  ```
+  referer.example-cdn.net=https://blog.example.com/
+  referer.img.example.org=www.example.org
+  ```
 
 Images load in the background, once their block is in view, the newest first: a block
 shows *loading…* until its image is ready, or the reason it can't be shown. Decoded images
@@ -171,6 +192,7 @@ cargo test shots::shots_focus -- --exact --ignored                # keys while t
 cargo test shots::shots_images_in_view -- --exact --ignored       # images load in view, memory budget
 SHOT_DIR=/tmp/shots cargo test shots::shots_theme -- --exact --ignored   # theme menu, dark theme, About
 SHOT_DIR=/tmp/shots cargo test shots::shots_images -- --exact --ignored  # images: formats, web, errors
+SHOT_DIR=/tmp/shots cargo test shots::shots_settings -- --exact --ignored  # Settings: Referer rules
 ```
 
 The ignored `shots*` tests drive the real UI with simulated clicks and keys through

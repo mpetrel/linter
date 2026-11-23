@@ -163,6 +163,7 @@ struct Shared {
     /// Changes when the document does; images of an older one are dropped.
     generation: AtomicU64,
     done: Mutex<Vec<Done>>,
+    referers: Mutex<Arc<Referers>>,
 }
 
 impl Shared {
@@ -211,6 +212,17 @@ impl Images {
     #[cfg(test)]
     pub fn requested(&self) -> usize {
         self.cache.borrow().len()
+    }
+
+    /// The Referers to send with the downloads started from now on.
+    pub fn set_referers(&self, referers: Referers) {
+        *self.shared.referers.lock().unwrap() = Arc::new(referers);
+    }
+
+    /// Forgets the downloads that failed, so that they're tried again when
+    /// they're asked for (with other Referers, say).
+    pub fn forget_failed_downloads(&self) {
+        self.cache.borrow_mut().retain(|key, entry| !matches!((key, entry), (Key::Url(_), Entry::Failed(_))));
     }
 
     /// Called while images are loading, when some may have arrived; it should
@@ -476,9 +488,12 @@ impl Pool {
             q.busy += 1;
             drop(q);
             let stale = || !shared.is_current(job.generation);
+            let referers = shared.referers.lock().unwrap().clone();
             // A decoder bug on a bad file shouldn't leave the image loading forever.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&job.key, job.max_width, self.agent.as_ref(), &stale)))
-                .unwrap_or_else(|_| Err(format!("{}: the decoder failed", job.key.name())));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                load(&job.key, job.max_width, self.agent.as_ref(), &referers, &stale)
+            }))
+            .unwrap_or_else(|_| Err(format!("{}: the decoder failed", job.key.name())));
             {
                 // The document may have changed meanwhile: then `clear` has
                 // emptied `done`, and nothing would take the image out again.
@@ -537,7 +552,13 @@ fn file_url_path(rest: &str) -> Option<String> {
 }
 
 /// Runs on a worker thread. Gives up once `stale` says the document was closed.
-fn load(key: &Key, max_width: u32, agent: Option<&ureq::Agent>, stale: &dyn Fn() -> bool) -> Result<Decoded, String> {
+fn load(
+    key: &Key,
+    max_width: u32,
+    agent: Option<&ureq::Agent>,
+    referers: &Referers,
+    stale: &dyn Fn() -> bool,
+) -> Result<Decoded, String> {
     if stale() {
         return Err(CLOSED.into());
     }
@@ -548,7 +569,8 @@ fn load(key: &Key, max_width: u32, agent: Option<&ureq::Agent>, stale: &dyn Fn()
         }
         Key::Url(url) => {
             let agent = agent.ok_or("no downloader")?;
-            let (bytes, content_type) = fetch(agent, url, stale).map_err(|why| format!("can't download {url}: {why}"))?;
+            let (bytes, content_type) =
+                fetch(agent, url, referers, stale).map_err(|why| format!("can't download {url}: {why}"))?;
             let ext = match content_type.as_deref() {
                 Some(t) if t.starts_with("image/svg") => Some("svg".to_owned()),
                 _ => url_extension(url),
@@ -585,17 +607,172 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-/// The body and content type of `url`. Stops reading once `stale` says the
+/// The Referers sent with downloads, from the settings.
+///
+/// Some sites serve their images only to their own pages: they turn away
+/// requests whose Referer names another site, and often those with none,
+/// which is what a browser sends for a page opened from a file. An image is
+/// asked for with no Referer, like that; if it's refused (403 Forbidden),
+/// once more with the image's own site, `https://host/`, which tells the
+/// server nothing it doesn't know and is let through by most of them.
+///
+/// For a site that wants another, the settings can name it:
+/// `referer.<domain>=<URL>` sends `<URL>` with the images of `<domain>` and
+/// its subdomains, from the first request on. The longest domain that
+/// matches wins. A `<URL>` without a scheme is a host and path:
+/// `example.com` stands for `https://example.com/`. The Settings dialog
+/// edits these lines.
+#[derive(Default, Debug)]
+pub struct Referers(Vec<(String, String)>);
+
+/// What a settings key's `<domain>` matches: `cdn.example.com` as given,
+/// `*.example.com` as `example.com`, or the host of a URL pasted in.
+fn domain_of(input: &str) -> Option<String> {
+    let input = input.trim().trim_start_matches("*.");
+    let url = if input.contains("://") { input.to_owned() } else { format!("http://{input}") };
+    let uri = url.parse::<ureq::http::Uri>().ok()?;
+    let host = uri.host()?.trim_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// The Referer sent for a rule's value: `https://` is added to a host.
+fn referer_of(value: &str) -> String {
+    match value.contains("://") {
+        true => value.to_owned(),
+        false if value.contains('/') => format!("https://{value}"),
+        false => format!("https://{value}/"),
+    }
+}
+
+impl Referers {
+    /// From the settings' `key=value` entries; keys other than
+    /// `referer.<domain>`, and empty values, are left out.
+    pub fn from_settings<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        Self::new(entries.into_iter().filter_map(|(key, value)| Some((key.strip_prefix("referer.")?, value))))
+    }
+
+    /// From (domain, Referer) rules, as the settings give them.
+    pub fn new<'a>(rules: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let rules = rules.into_iter().filter_map(|(domain, value)| {
+            let value = value.trim();
+            Some((domain_of(domain)?, referer_of(value))).filter(|_| !value.is_empty())
+        });
+        Referers(rules.collect())
+    }
+
+    /// Checks the rules typed in the Settings dialog, as (domain, Referer),
+    /// and gives them as they're saved: trimmed, with the domain as it's
+    /// matched, and without the rows left empty. Or says what's wrong.
+    pub fn check(rows: &[(String, String)]) -> Result<Vec<(String, String)>, String> {
+        let mut rules: Vec<(String, String)> = Vec::new();
+        for (domain, referer) in rows {
+            let (typed, referer) = (domain.trim(), referer.trim());
+            if typed.is_empty() && referer.is_empty() {
+                continue;
+            }
+            if typed.is_empty() {
+                return Err(format!("Give the domain whose images are asked for with the Referer {referer}."));
+            }
+            let Some(domain) = domain_of(typed).filter(|_| !typed.contains(char::is_whitespace)) else {
+                return Err(format!("“{typed}” isn't a domain, like cdn.example.com."));
+            };
+            if referer.is_empty() {
+                return Err(format!("Give the Referer to send with the images of {domain}."));
+            }
+            let web = referer_of(referer)
+                .parse::<ureq::http::Uri>()
+                .is_ok_and(|u| matches!(u.scheme_str(), Some("http" | "https")) && u.host().is_some_and(|h| !h.is_empty()));
+            if !web {
+                return Err(format!("The Referer for {domain} isn't a web address, like https://www.example.com/."));
+            }
+            if rules.iter().any(|(d, _)| *d == domain) {
+                return Err(format!("{domain} is listed twice."));
+            }
+            rules.push((domain, referer.to_owned()));
+        }
+        Ok(rules)
+    }
+
+    /// The domain and Referer of the rule for `host`. Of rules for the same
+    /// domain the first, as for the other settings.
+    fn find(&self, host: &str) -> Option<&(String, String)> {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        // Addresses have no subdomains: 0.1 doesn't stand for 10.0.0.1.
+        let address = host.starts_with('[') || host.parse::<std::net::IpAddr>().is_ok();
+        let matches = |domain: &str| {
+            host == domain || !address && host.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.'))
+        };
+        self.0.iter().rev().filter(|(domain, _)| matches(domain)).max_by_key(|(domain, _)| domain.len())
+    }
+}
+
+/// The body and content type of `url`, asked for with the Referer that
+/// `referers` gives for its host. Stops reading once `stale` says the
 /// document was closed.
-fn fetch(agent: &ureq::Agent, url: &str, stale: &dyn Fn() -> bool) -> Result<(Vec<u8>, Option<String>), String> {
+fn fetch(
+    agent: &ureq::Agent,
+    url: &str,
+    referers: &Referers,
+    stale: &dyn Fn() -> bool,
+) -> Result<(Vec<u8>, Option<String>), String> {
+    let uri: ureq::http::Uri = url.parse().map_err(|e: ureq::http::uri::InvalidUri| describe(&ureq::Error::Http(e.into())))?;
+    let host = uri.host().unwrap_or_default();
+    let forbidden = |e: &ureq::Error| matches!(e, ureq::Error::StatusCode(403));
+    if let Some((domain, referer)) = referers.find(host) {
+        return get(agent, &uri, Some(referer), stale).map_err(|e| match forbidden(&e) {
+            true => format!("{}, with Referer {referer} (from Settings, for {domain})", describe(&e)),
+            false => describe(&e),
+        });
+    }
+    match get(agent, &uri, None, stale) {
+        // Maybe only for its own site's pages.
+        Err(e) if forbidden(&e) => {
+            let site = site(&uri);
+            get(agent, &uri, Some(&site), stale).map_err(|e| match forbidden(&e) {
+                true => format!(
+                    "{}, also with Referer {site}; in Settings, add {} with the Referer it wants",
+                    describe(&e),
+                    host.trim_end_matches('.').to_ascii_lowercase()
+                ),
+                false => describe(&e),
+            })
+        }
+        result => result.map_err(|e| describe(&e)),
+    }
+}
+
+/// The site `uri` is on, as browsers send it for a Referer: `https://host/`.
+fn site(uri: &ureq::http::Uri) -> String {
+    let scheme = uri.scheme_str().unwrap_or("https");
+    let port = match (scheme, uri.port_u16()) {
+        (_, None) | ("http", Some(80)) | ("https", Some(443)) => String::new(),
+        (_, Some(port)) => format!(":{port}"),
+    };
+    format!("{scheme}://{}{port}/", uri.host().unwrap_or_default().to_ascii_lowercase())
+}
+
+/// One request for `uri`, with `referer` if there's one.
+fn get(
+    agent: &ureq::Agent,
+    uri: &ureq::http::Uri,
+    referer: Option<&str>,
+    stale: &dyn Fn() -> bool,
+) -> Result<(Vec<u8>, Option<String>), ureq::Error> {
     use std::io::Read;
-    let mut request = agent.get(url).header("Accept", ACCEPT);
+    let closed = || ureq::Error::Io(std::io::Error::other(CLOSED));
+    if stale() {
+        return Err(closed());
+    }
+    let mut request = agent.get(uri.clone()).header("Accept", ACCEPT);
+    if let Some(referer) = referer {
+        request = request.header("Referer", referer);
+    }
     // A proxy can't reach this machine's own servers, so browsers bypass it
     // for them; ureq only does if NO_PROXY says so.
-    if request.uri_ref().and_then(|u| u.host()).is_some_and(is_loopback) {
+    if uri.host().is_some_and(is_loopback) {
         request = request.config().proxy(None).build();
     }
-    let mut response = request.call().map_err(|e| describe(&e))?;
+    let mut response = request.call()?;
     let content_type = response
         .headers()
         .get("content-type")
@@ -605,13 +782,13 @@ fn fetch(agent: &ureq::Agent, url: &str, stale: &dyn Fn() -> bool) -> Result<(Ve
     let (mut bytes, mut chunk) = (Vec::new(), vec![0; 64 << 10]);
     loop {
         if stale() {
-            return Err(CLOSED.into());
+            return Err(closed());
         }
         match body.read(&mut chunk) {
             Ok(0) => return Ok((bytes, content_type)),
             Ok(n) => bytes.extend_from_slice(&chunk[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(describe(&ureq::Error::from(e))),
+            Err(e) => return Err(ureq::Error::from(e)),
         }
     }
 }
@@ -1078,24 +1255,44 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    type Response = (u16, &'static str, Vec<u8>);
+
     /// Serves each request with the next of `responses` (status, content type, body).
-    pub(crate) fn serve(responses: Vec<(u16, &'static str, Vec<u8>)>) -> String {
+    pub(crate) fn serve(responses: Vec<Response>) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            for (status, content_type, body) in responses {
-                let Ok((mut stream, _)) = listener.accept() else { return };
-                let mut request = [0u8; 4096];
-                let _ = stream.read(&mut request);
-                let head = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(&body);
+            for response in responses {
+                let Ok((stream, _)) = listener.accept() else { return };
+                answer(stream, |_| response);
             }
         });
         format!("http://{addr}")
+    }
+
+    /// Serves each request with what `respond` gives for its head.
+    fn serve_by(respond: impl Fn(&str) -> Response + Send + 'static) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                answer(stream, &respond);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn answer(mut stream: std::net::TcpStream, respond: impl FnOnce(&str) -> Response) {
+        let mut request = [0u8; 4096];
+        let n = stream.read(&mut request).unwrap_or(0);
+        let (status, content_type, body) = respond(&String::from_utf8_lossy(&request[..n]));
+        let head = format!(
+            "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(&body);
     }
 
     #[test]
@@ -1110,13 +1307,136 @@ pub(crate) mod tests {
             (200, "image/svg+xml", svg),
         ]);
         let agent = agent();
-        let get = |path: &str| load(&Key::Url(format!("{base}{path}")), 1640, Some(&agent), &|| false);
+        let get = |path: &str| load(&Key::Url(format!("{base}{path}")), 1640, Some(&agent), &Referers::default(), &|| false);
         assert_eq!(size(&get("/a.png").unwrap()), (40, 30));
         assert!(get("/b.png").unwrap_err().ends_with("/b.png: the server answered 404 Not Found"));
         assert!(get("/c.png").unwrap_err().ends_with("/c.png: not an image (got a web page)"));
         assert!(matches!(get("/icon"), Ok(Decoded::Svg(_))), "SVG is recognised by its content type");
         let refused = get("/gone.png").unwrap_err();
         assert!(refused.starts_with(&format!("can't download {base}/gone.png: ")), "{refused}");
+    }
+
+    #[test]
+    fn referers_from_the_settings() {
+        let referers = Referers::from_settings([
+            ("theme", "dark"),
+            ("referer.example-cdn.net", "https://blog.example.com/post/1"),
+            ("referer.*.Example.com", "example.com"),
+            ("referer.img.example.com", "www.example.com/gallery"),
+            ("referer.img.example.com", "https://ignored.example/"),
+            ("referer.10.0.0.1", "intranet.lan"),
+            ("referer.0.1", "https://ignored.example/"),
+            ("referer.", "https://ignored.example/"),
+            ("referer.no-value.org", ""),
+        ]);
+        fn find_in<'a>(referers: &'a Referers, host: &str) -> Option<&'a str> {
+            referers.find(host).map(|(_, referer)| referer.as_str())
+        }
+        let find = |host: &str| find_in(&referers, host);
+        assert_eq!(find("example-cdn.net"), Some("https://blog.example.com/post/1"));
+        assert_eq!(find("a.b.example-cdn.net"), Some("https://blog.example.com/post/1"), "and its subdomains");
+        assert_eq!(find("other-example-cdn.net"), None);
+        assert_eq!(find("cdn.EXAMPLE.com."), Some("https://example.com/"));
+        assert_eq!(find("a.img.example.com"), Some("https://www.example.com/gallery"), "the longest domain, the first rule");
+        assert_eq!(find("10.0.0.1"), Some("https://intranet.lan/"));
+        assert_eq!(find("172.16.0.1"), None, "addresses have no subdomains");
+        assert_eq!(find("no-value.org"), None);
+        assert_eq!(find("ignored.example"), None);
+        // A URL's host, and the host of a domain with a port.
+        let referers = Referers::new([("https://Img.Example.com/a/b.png", "x.org"), ("cdn.example.net:8080", "y.org/")]);
+        assert_eq!(find_in(&referers, "img.example.com"), Some("https://x.org/"));
+        assert_eq!(find_in(&referers, "cdn.example.net"), Some("https://y.org/"));
+
+        let uri = |url: &str| url.parse::<ureq::http::Uri>().unwrap();
+        assert_eq!(site(&uri("https://user@CDN.Example.com/a/b.png?x=1")), "https://cdn.example.com/");
+        assert_eq!(site(&uri("https://cdn.example.com:443/a.png")), "https://cdn.example.com/");
+        assert_eq!(site(&uri("http://[::1]:8080/a.png")), "http://[::1]:8080/");
+    }
+
+    #[test]
+    fn checks_the_rules_typed_in_settings() {
+        let check = |rows: &[(&str, &str)]| {
+            Referers::check(&rows.iter().map(|(d, r)| (d.to_string(), r.to_string())).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            check(&[
+                (" *.Example-CDN.net ", " https://blog.example.com/post "),
+                ("", ""),
+                ("https://img.example.org/a.png", "www.example.org"),
+            ]),
+            Ok(vec![
+                ("example-cdn.net".into(), "https://blog.example.com/post".into()),
+                ("img.example.org".into(), "www.example.org".into()),
+            ])
+        );
+        let error = |rows: &[(&str, &str)]| check(rows).unwrap_err();
+        assert!(error(&[("", "https://a.example/")]).starts_with("Give the domain"));
+        assert!(error(&[("cdn.example.com", " ")]).starts_with("Give the Referer to send with the images of cdn.example.com"));
+        assert!(error(&[("cdn example.com", "a.example")]).starts_with("“cdn example.com” isn't a domain"));
+        assert!(error(&[("a.example", "ftp://a.example/")]).starts_with("The Referer for a.example isn't a web address"));
+        assert!(error(&[("a.example", "https://a b.example/")]).starts_with("The Referer for a.example isn't"));
+        assert_eq!(error(&[("a.example", "x.org"), ("A.example.", "y.org")]), "a.example is listed twice.");
+    }
+
+    #[test]
+    fn asks_again_with_a_referer_when_refused() {
+        let png = encode(&DynamicImage::ImageRgb8(gradient(40, 30)), ImageFormat::Png);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        // /site.png only for the server's own site, /page.png only for one page of a blog.
+        let base = serve_by(move |request| {
+            let header = |name: &str| {
+                request.lines().find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim()))
+            };
+            let path = request.split(' ').nth(1).unwrap_or_default();
+            let referer = header("referer");
+            log.lock().unwrap().push(referer.map(str::to_owned));
+            let wanted = match path {
+                "/site.png" => format!("http://{}/", header("host").unwrap_or_default()),
+                "/page.png" => "https://blog.example/post".to_owned(),
+                _ => return (404, "text/plain", b"not found".to_vec()),
+            };
+            match referer == Some(&wanted) {
+                true => (200, "image/png", png.clone()),
+                false => (403, "text/plain", b"hotlinking not allowed".to_vec()),
+            }
+        });
+        let agent = agent();
+        let get = |path: &str, referers: &Referers| load(&Key::Url(format!("{base}{path}")), 1640, Some(&agent), referers, &|| false);
+        let referers = |rules: &[(&str, &str)]| Referers::from_settings(rules.iter().copied());
+        let requests = || std::mem::take(&mut *seen.lock().unwrap());
+        let site = format!("{base}/");
+
+        // Refused without a Referer: asked for again with the site's.
+        let none = referers(&[]);
+        assert_eq!(size(&get("/site.png", &none).unwrap()), (40, 30));
+        assert_eq!(requests(), [None, Some(site.clone())]);
+        let refused = get("/page.png", &none).unwrap_err();
+        assert!(
+            refused.ends_with(&format!(
+                "/page.png: the server answered 403 Forbidden, also with Referer {site}; \
+                 in Settings, add 127.0.0.1 with the Referer it wants"
+            )),
+            "{refused}"
+        );
+        assert_eq!(requests().len(), 2);
+        // Only a refusal is asked for again.
+        assert!(get("/missing.png", &none).unwrap_err().ends_with("the server answered 404 Not Found"));
+        assert_eq!(requests(), [None]);
+
+        // The settings' Referer is sent from the first request on, and only it.
+        let blog = referers(&[("referer.127.0.0.1", "https://blog.example/post")]);
+        assert_eq!(size(&get("/page.png", &blog).unwrap()), (40, 30));
+        assert_eq!(requests(), [Some("https://blog.example/post".to_owned())]);
+        let refused = get("/site.png", &blog).unwrap_err();
+        assert!(
+            refused.ends_with(
+                "/site.png: the server answered 403 Forbidden, with Referer https://blog.example/post \
+                 (from Settings, for 127.0.0.1)"
+            ),
+            "{refused}"
+        );
+        assert_eq!(requests().len(), 1);
     }
 
     #[test]

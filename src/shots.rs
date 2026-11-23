@@ -790,11 +790,11 @@ fn shots_theme() {
     app.show().unwrap();
     let h = Harness { window, app: app.as_weak(), dir };
     let dark = || app.global::<Theme>().get_dark();
-    // The About button is at the right end of the toolbar, the Theme menu
-    // left of it.
+    // The About button is at the right end of the toolbar, then Settings…,
+    // then the Theme menu.
     let (about_x, about_y) = (W as f32 - 43.0, 22.0);
-    let (menu_x, menu_y) = (W as f32 - 115.0, 22.0);
-    let (item_x, light_y, dark_y) = (W as f32 - 162.0, 59.0, 89.0);
+    let (menu_x, menu_y) = (W as f32 - 201.0, 22.0);
+    let (item_x, light_y, dark_y) = (W as f32 - 248.0, 59.0, 89.0);
 
     h.snap("t1-light");
     h.click(menu_x, menu_y);
@@ -1030,4 +1030,140 @@ fn shots_images_in_view() {
 
     std::fs::remove_dir_all(&dir).unwrap();
     println!("images in view checks passed");
+}
+
+/// The Settings dialog: Referer rules for web images, saved to the settings
+/// file and used at once, so an image refused before shows.
+#[test]
+#[ignore]
+fn shots_settings() {
+    // The Settings button, and with two rules the first one's ×.
+    const SETTINGS_X: f32 = W as f32 - 120.0;
+    const REMOVE_X: f32 = 803.0;
+    const FIRST_ROW_Y: f32 = 452.0;
+    use crate::images::tests::{encode, gradient};
+    use image::{DynamicImage, ImageFormat};
+    use std::io::{Read, Write};
+
+    let dir = PathBuf::from(std::env::var("SHOT_DIR").unwrap_or_else(|_| "target/shots".into()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let docs = std::env::temp_dir().join(format!("linter-shots-settings-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&docs);
+    std::fs::create_dir_all(&docs).unwrap();
+    let settings = docs.join("config").join("settings");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, "theme=light\n# hand-written\nreferer.example-cdn.net=https://blog.example.com/\n").unwrap();
+
+    // Serves the image only with the Referer of one blog page.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    let png = encode(&DynamicImage::ImageRgb8(gradient(320, 60)), ImageFormat::Png);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut request = [0u8; 4096];
+            let n = stream.read(&mut request).unwrap_or(0);
+            let request = String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
+            if request.contains("\r\nreferer: https://blog.example/post\r\n") {
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", png.len());
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&png);
+            } else {
+                let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        }
+    });
+    let file = docs.join("settings.md");
+    std::fs::write(&file, format!("# Settings\n\nSome text.\n\n![blog]({server}/page.png)\n")).unwrap();
+
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    let app = App::new().unwrap();
+    window.set_size(PhysicalSize::new(W, H));
+    let editor = Rc::new(RefCell::new(Editor::new(&app)));
+    wire(&app, &editor);
+    wire_settings(&app, &editor, Some(settings.clone()));
+    editor.borrow_mut().load(file);
+    app.show().unwrap();
+    let h = Harness { window, app: app.as_weak(), dir };
+
+    let row = |i: usize| editor.borrow().model.row_data(i).unwrap();
+    let wait = |done: &dyn Fn() -> bool| {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(10), "images didn't load");
+            h.settle();
+        }
+    };
+    // Blocks: 0 heading, 1 paragraph, 2 the image.
+    wait(&|| row(2).caption.contains("403"));
+    h.snap("s0-refused");
+    assert!(row(2).caption.ends_with("in Settings, add 127.0.0.1 with the Referer it wants"), "{}", row(2).caption);
+
+    // Opening Settings while a block is being edited stops editing, and the
+    // rule from the file is shown.
+    editor.borrow_mut().request_edit(Some(1), Some(Cursor::End));
+    h.settle();
+    let paragraph = editor.borrow().doc.blocks[1].src.clone();
+    h.click(SETTINGS_X, 22.0);
+    assert!(app.get_settings_open(), "the Settings button opens the dialog");
+    assert_eq!(editor.borrow().editing, None);
+    let rules = || {
+        let model = app.get_referer_rules();
+        model.iter().map(|r| (r.domain.to_string(), r.referer.to_string())).collect::<Vec<_>>()
+    };
+    let rule = |d: &str, r: &str| (d.to_owned(), r.to_owned());
+    assert_eq!(rules(), [rule("example-cdn.net", "https://blog.example.com/")]);
+    h.snap("s1-settings");
+
+    // Add Site gives the new row's domain field the focus; Tab moves to its
+    // Referer, Enter saves. The other lines of the file are kept.
+    h.click(260.0, 513.0);
+    h.type_text("127.0.0.1");
+    h.key(SharedString::from(Key::Tab));
+    h.type_text("https://blog.example/post");
+    assert_eq!(rules()[1], rule("127.0.0.1", "https://blog.example/post"));
+    h.snap("s2-added");
+    h.key(SharedString::from(Key::Return));
+    assert!(!app.get_settings_open(), "Enter saves and closes the dialog");
+    let saved = "theme=light\n# hand-written\nreferer.example-cdn.net=https://blog.example.com/\nreferer.127.0.0.1=https://blog.example/post\n";
+    assert_eq!(std::fs::read_to_string(&settings).unwrap(), saved);
+    // The image refused before is asked for again, with the new Referer.
+    wait(&|| row(2).has_image);
+    h.snap("s3-shown");
+
+    // A rule without a Referer isn't saved. Tab doesn't take the keys to the
+    // document behind the dialog, and Esc leaves the file as it was.
+    h.click(SETTINGS_X, 22.0);
+    assert_eq!(rules().len(), 2, "read back from the file");
+    app.invoke_add_referer_rule();
+    h.settle();
+    h.type_text("cdn.example.org");
+    h.key(SharedString::from(Key::Return));
+    assert!(app.get_settings_open());
+    assert_eq!(app.get_settings_error(), "Give the Referer to send with the images of cdn.example.org.");
+    h.snap("s4-error");
+    for _ in 0..8 {
+        h.key(SharedString::from(Key::Tab));
+        h.type_text("z");
+    }
+    h.key(SharedString::from(Key::Escape));
+    assert!(!app.get_settings_open(), "Esc closes the dialog");
+    assert_eq!(std::fs::read_to_string(&settings).unwrap(), saved);
+    assert_eq!(editor.borrow().doc.blocks[1].src, paragraph, "keys don't reach the document");
+
+    // × removes a rule. In the dark theme.
+    app.invoke_apply_theme(true);
+    h.click(SETTINGS_X, 22.0);
+    assert_eq!(rules().len(), 2, "what wasn't saved is gone");
+    h.snap("s5-dark");
+    h.click(REMOVE_X, FIRST_ROW_Y);
+    assert_eq!(rules(), [rule("127.0.0.1", "https://blog.example/post")]);
+    app.invoke_save_settings();
+    h.settle();
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        "theme=light\n# hand-written\nreferer.127.0.0.1=https://blog.example/post\n"
+    );
+    let _ = std::fs::remove_dir_all(&docs);
 }

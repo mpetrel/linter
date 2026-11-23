@@ -4,7 +4,7 @@
 // one (or moving into it with the arrow keys) swaps it for its raw Markdown
 // in place, so `## Title` can become `### Title` by typing another `#`.
 
-import { AboutSlint, ListView, Palette } from "std-widgets.slint";
+import { AboutSlint, LineEdit, ListView, Palette, ScrollView } from "std-widgets.slint";
 
 export enum BlockKind { empty, paragraph, heading, code, quote, list, rule, table, image, raw }
 
@@ -47,6 +47,13 @@ export struct Modifiers {
     alt: bool,
     shift: bool,
     meta: bool,
+}
+
+// A Settings rule: images of `domain` and its subdomains are asked for with
+// the Referer `referer`.
+export struct RefererRule {
+    domain: string,
+    referer: string,
 }
 
 // action: 0 = let the text field handle the key, 1 = handled, 2 = replace text
@@ -805,6 +812,32 @@ component DialogButton inherits Rectangle {
     }
 }
 
+// The × at the end of a Settings row, which removes it.
+component RemoveButton inherits Rectangle {
+    callback clicked;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    background: ta.pressed ? Theme.pressed : ta.has-hover ? Theme.hover : transparent;
+
+    Path {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 10px;
+        height: 10px;
+        viewbox-width: 10;
+        viewbox-height: 10;
+        commands: "M 1 1 L 9 9 M 9 1 L 1 9";
+        stroke: ta.has-hover ? Theme.danger : Theme.soft;
+        stroke-width: 1.5px;
+    }
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
 component MenuEntry inherits Rectangle {
     in property <string> text;
     in property <bool> checked;
@@ -936,6 +969,15 @@ export component App inherits Window {
     // Shown in the About dialog.
     in property <string> version;
     out property <bool> about-open;
+    // The Settings dialog. Rust fills `referer-rules` from the settings file
+    // and opens it; Cancel and Esc close it here, Save in Rust once the rules
+    // are saved. `focus-rule` is the row whose domain field takes the focus
+    // when it's created (one just added).
+    in-out property <bool> settings-open;
+    in property <[RefererRule]> referer-rules;
+    in property <int> focus-rule: -1;
+    in property <string> settings-error;
+    in property <string> settings-path;
 
     callback edited(index: int, text: string);
     callback key-action(index: int, command: string, text: string, cursor: int, anchor: int) -> EditResult;
@@ -949,6 +991,10 @@ export component App inherits Window {
     // Click on empty space beside or above the document.
     callback click-blank();
     callback choose-theme(dark: bool);
+    callback open-settings();
+    callback add-referer-rule();
+    callback remove-referer-rule(index: int);
+    callback save-settings();
     // Esc while the block being edited is scrolled out of view.
     callback finish-edit();
     // The document list scrolled.
@@ -995,8 +1041,10 @@ export component App inherits Window {
     // the next key tries again.
     property <int> reveal-tries;
     property <length> view-height: sv.visible-height;
+    // The Settings dialog's domain column.
+    property <length> domain-width: 200px;
     // A dialog keeps the focus while it's open.
-    property <bool> modal-open: root.about-open || root.confirm-open;
+    property <bool> modal-open: root.about-open || root.confirm-open || root.settings-open;
 
     // A new document starts at its top.
     public function scroll-to-top() {
@@ -1149,6 +1197,19 @@ export component App inherits Window {
         }
     }
 
+    function close-settings() {
+        root.settings-open = false;
+    }
+
+    changed settings-open => {
+        if root.settings-open {
+            root.about-open = false;
+            fs.focus();
+        } else {
+            root.dialog-closed();
+        }
+    }
+
     changed confirm-open => {
         if root.confirm-open {
             // One dialog at a time.
@@ -1197,6 +1258,18 @@ export component App inherits Window {
                 }
                 return EventResult.accept;
             }
+            // Settings: Esc cancels, Enter saves; other keys go to its fields.
+            if root.settings-open {
+                if e.text == Key.Escape {
+                    root.close-settings();
+                    return EventResult.accept;
+                }
+                if e.text == Key.Return {
+                    root.save-settings();
+                    return EventResult.accept;
+                }
+                return EventResult.reject;
+            }
             // About: Esc or Enter closes it, other keys do nothing.
             if root.about-open {
                 if e.text == Key.Escape || e.text == Key.Return {
@@ -1223,7 +1296,7 @@ export component App inherits Window {
         // Only reached with nothing else focused: the window holds the focus
         // for the block being edited (see park-focus), or nothing is edited.
         key-pressed(e) => {
-            if !self.has-focus || root.editing-index < 0 {
+            if !self.has-focus || root.editing-index < 0 || root.modal-open {
                 return EventResult.reject;
             }
             if e.text == Key.Escape {
@@ -1276,6 +1349,12 @@ export component App inherits Window {
                     ThemeMenu {
                         choose(dark) => {
                             root.choose-theme(dark);
+                        }
+                    }
+                    ToolButton {
+                        text: "Settings…";
+                        clicked => {
+                            root.open-settings();
                         }
                     }
                     ToolButton {
@@ -1532,7 +1611,150 @@ export component App inherits Window {
             }
         }
 
-        // Last, so that it shows above the About dialog.
+        // It doesn't close on a click beside it, which would lose what was typed.
+        if root.settings-open: Rectangle {
+            background: Theme.scrim;
+            TouchArea {
+                // Don't scroll the document behind the dialog.
+                scroll-event(e) => {
+                    return EventResult.accept;
+                }
+            }
+            Rectangle {
+                width: min(640px, parent.width - 40px);
+                height: min(settings.preferred-height, parent.height - 40px);
+                background: Theme.page;
+                border-radius: 10px;
+                drop-shadow-blur: 24px;
+                drop-shadow-color: Theme.shadow;
+                TouchArea { }
+                settings := VerticalLayout {
+                    padding: 22px;
+                    spacing: 10px;
+                    Text {
+                        text: "Settings";
+                        font-size: 17px;
+                        font-weight: 700;
+                        color: Theme.ink;
+                    }
+                    Text {
+                        text: "Referer for web images";
+                        font-size: 14px;
+                        font-weight: 600;
+                        color: Theme.ink;
+                    }
+                    Text {
+                        text: "Some sites serve their images only to their own pages and refuse requests without a Referer. Such an image is asked for again with its own site as the Referer. For a site that wants another page, add it here: the Referer is sent with every image of that domain and its subdomains.";
+                        font-size: 13px;
+                        color: Theme.soft;
+                        wrap: word-wrap;
+                    }
+                    if root.referer-rules.length == 0: Text {
+                        text: "No sites added.";
+                        font-size: 13px;
+                        color: Theme.muted;
+                    }
+                    if root.referer-rules.length > 0: VerticalLayout {
+                        spacing: 4px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                width: root.domain-width;
+                                text: "Domain";
+                                font-size: 12px;
+                                color: Theme.soft;
+                            }
+                            Text {
+                                text: "Referer to send";
+                                font-size: 12px;
+                                color: Theme.soft;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                        rules-sv := ScrollView {
+                            // About five rows, then it scrolls.
+                            height: min(rules.preferred-height, 190px);
+                            content-width: self.visible-width;
+                            content-height: rules.preferred-height;
+                            rules := VerticalLayout {
+                                width: rules-sv.visible-width;
+                                spacing: 6px;
+                                for rule[i] in root.referer-rules: HorizontalLayout {
+                                    spacing: 8px;
+                                    LineEdit {
+                                        width: root.domain-width;
+                                        font-size: 13px;
+                                        placeholder-text: "cdn.example.com";
+                                        text <=> rule.domain;
+                                        init => {
+                                            if i == root.focus-rule {
+                                                self.focus();
+                                            }
+                                        }
+                                    }
+                                    LineEdit {
+                                        horizontal-stretch: 1;
+                                        font-size: 13px;
+                                        placeholder-text: "https://www.example.com/";
+                                        text <=> rule.referer;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        RemoveButton {
+                                            clicked => {
+                                                root.remove-referer-rule(i);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        alignment: start;
+                        DialogButton {
+                            text: "Add Site";
+                            clicked => {
+                                root.add-referer-rule();
+                            }
+                        }
+                    }
+                    if root.settings-error != "": Text {
+                        text: root.settings-error;
+                        font-size: 13px;
+                        color: Theme.danger;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        padding-top: 8px;
+                        Text {
+                            text: root.settings-path == "" ? "" : "Saved in \{root.settings-path}";
+                            font-size: 11px;
+                            color: Theme.muted;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                        DialogButton {
+                            text: "Cancel";
+                            clicked => {
+                                root.close-settings();
+                            }
+                        }
+                        DialogButton {
+                            text: "Save";
+                            primary: true;
+                            clicked => {
+                                root.save-settings();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Last, so that it shows above the other dialogs.
         if root.confirm-open: Rectangle {
             background: Theme.scrim;
             TouchArea {
