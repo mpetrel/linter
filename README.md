@@ -177,7 +177,9 @@ The ignored `shots*` tests drive the real UI with simulated clicks and keys thro
 Slint's software renderer, and write PNG screenshots (they need ImageMagick's `magick`).
 Run each one on its own, as shown, because each sets up its own Slint platform.
 
-## License note
+## License
+
+linter is released under the [MIT License](LICENSE).
 
 Slint is used under the [Slint Royalty-free Desktop, Mobile, and Web Applications
 License 2.0](https://github.com/slint-ui/slint/blob/master/LICENSES/LicenseRef-Slint-Royalty-free-2.0.md).

@@ -3,6 +3,7 @@ name = "linter"
 version = "0.1.0"
 edition = "2024"
 description = "A small Typora-like live-preview Markdown editor built with Rust and Slint"
+license = "MIT"
 
 [dependencies]
 slint = { version = "1.19", features = ["unstable-winit-030", "raw-window-handle-06"] }
