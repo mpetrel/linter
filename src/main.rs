@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod doc;
+mod images;
 mod ops;
 mod render;
 #[cfg(test)]
@@ -19,6 +20,11 @@ slint::include_modules!();
 
 /// Cursor request meaning "keep the cursor where the click put it".
 const KEEP_CURSOR: i32 = -2;
+
+/// How long a key held for the text field of the block being edited is kept:
+/// bringing the block back takes a few frames, and a key replayed much later,
+/// say after a dialog, would come as a surprise.
+const HELD_KEY_LIFETIME: Duration = Duration::from_secs(1);
 
 const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "mkdn", "txt"];
 
@@ -47,6 +53,13 @@ struct Editor {
     pending: Option<Pending>,
     /// Words and characters in the document, kept up to date while typing.
     counts: (usize, usize),
+    images: images::Images,
+    /// `image_width` when `rescaled` last looked.
+    rendered_width: StdCell<u32>,
+    /// Keys pressed while the window held the focus for the block being
+    /// edited that only its text field can handle, with when they were
+    /// pressed. They're replayed when it has the focus again.
+    held_keys: Vec<(SharedString, Instant)>,
 }
 
 impl Editor {
@@ -68,7 +81,11 @@ impl Editor {
             modified: false,
             pending: None,
             counts: (0, 0),
+            images: images::Images::new(),
+            rendered_width: StdCell::new(0),
+            held_keys: Vec::new(),
         };
+        editor.rendered_width.set(editor.image_width());
         editor.rebuild();
         editor
     }
@@ -92,7 +109,67 @@ impl Editor {
 
     fn render_row(&self, i: usize, base: &Path) -> Block {
         let src = &self.doc.blocks[i].src;
-        to_ui(render::render(src, &self.refs), src, base)
+        let r = render::render(src, &self.refs);
+        let image = r.image.as_ref().map(|(url, alt)| self.image(url, alt, base));
+        to_ui(r, src, image)
+    }
+
+    /// The image to show for an image block, or why there's none (yet).
+    fn image(&self, url: &str, alt: &str, base: &Path) -> (slint::Image, bool, SharedString) {
+        let alt = if alt.is_empty() { "image" } else { alt };
+        match self.images.get(url, base, self.image_width()) {
+            images::Lookup::Ready(image) => (image, true, SharedString::new()),
+            images::Lookup::Loading => (slint::Image::default(), false, format!("{alt} — loading…").into()),
+            images::Lookup::Failed(why) => (slint::Image::default(), false, format!("{alt} — {why}").into()),
+        }
+    }
+
+    /// Widest an image is decoded at, in pixels: the document column at the
+    /// window's scale, and at least at 2×, as the scale may not be known yet.
+    fn image_width(&self) -> u32 {
+        let (column, scale) = self
+            .ui
+            .upgrade()
+            .map_or((820.0, 1.0), |ui| (ui.global::<Theme>().get_column(), ui.window().scale_factor()));
+        (column * scale.max(2.0)).ceil() as u32
+    }
+
+    /// Shows the images that finished loading.
+    fn images_ready(&self) {
+        let collected = self.images.collect();
+        if collected.new || collected.sharper {
+            self.refresh_images(collected.sharper);
+        }
+    }
+
+    /// Renders the image blocks again that wait for their image, and with
+    /// `all` the ones that show one too.
+    fn refresh_images(&self, all: bool) {
+        let base = self.base_dir();
+        for i in 0..self.model.row_count() {
+            // The block being edited shows its image when editing ends.
+            if Some(i) == self.editing {
+                continue;
+            }
+            let Some(row) = self.model.row_data(i) else { continue };
+            if row.kind == BlockKind::Image && (all || !row.has_image) {
+                let new = self.render_row(i, &base);
+                if new.has_image != row.has_image || new.image != row.image || new.caption != row.caption {
+                    self.model.set_row_data(i, new);
+                }
+            }
+        }
+    }
+
+    /// Called when the window's scale may have changed: it isn't known before
+    /// the window first shows, and changes on another screen. Images scaled
+    /// down to the column are decoded again if it's wider in pixels now.
+    fn rescaled(&self) {
+        let width = self.image_width();
+        if width > self.rendered_width.get() {
+            self.rendered_width.set(width);
+            self.refresh_images(true);
+        }
     }
 
     fn rebuild(&mut self) {
@@ -201,6 +278,7 @@ impl Editor {
     fn set_editing(&mut self, target: Option<usize>, cursor: i32) {
         self.editing = target;
         self.original = target.map(|t| self.doc.blocks[t].src.clone()).unwrap_or_default();
+        self.held_keys.clear();
         self.edit_seq += 1;
         self.edit_cursor = cursor;
         let seq = self.edit_seq;
@@ -286,9 +364,10 @@ impl Editor {
         self.set_status("", false);
     }
 
-    /// A key pressed while the block being edited is scrolled out of view, so
-    /// that its text field is gone: text is typed at the saved caret, and any
-    /// key but a lone modifier brings the block back into view. Returns
+    /// A key pressed while the window holds the focus for the block being
+    /// edited (it may be scrolled out of view, with no text field): text is
+    /// typed at the saved caret, other keys are held for the text field, and
+    /// any key but a lone modifier brings the block back into view. Returns
     /// whether the key was used.
     fn key_away(&mut self, text: &str, command: bool) -> bool {
         let Some(i) = self.editing.filter(|&i| i < self.doc.blocks.len()) else { return false };
@@ -296,7 +375,12 @@ impl Editor {
             return false;
         }
         let Some(ui) = self.ui.upgrade() else { return false };
-        if !command && is_typed_text(text) {
+        self.held_keys.retain(|(_, at)| at.elapsed() < HELD_KEY_LIFETIME);
+        if !self.held_keys.is_empty() || command || !is_typed_text(text) {
+            // Backspace, the arrows, Ctrl+V and so on, and anything after
+            // them, so that keys keep their order.
+            self.held_keys.push((text.into(), Instant::now()));
+        } else {
             let src = &self.doc.blocks[i].src;
             let (caret, anchor) = if ui.get_caret_seq() == self.edit_seq {
                 (ui.get_saved_caret().max(0) as usize, ui.get_saved_anchor().max(0) as usize)
@@ -318,6 +402,26 @@ impl Editor {
         }
         ui.invoke_bring_back();
         true
+    }
+
+    /// The text field of the block being edited has the focus again: the keys
+    /// held for it, but not ones so old that they'd come as a surprise.
+    fn take_held_keys(&mut self) -> Vec<SharedString> {
+        std::mem::take(&mut self.held_keys)
+            .into_iter()
+            .filter(|(_, at)| at.elapsed() < HELD_KEY_LIFETIME)
+            .map(|(text, _)| text)
+            .collect()
+    }
+
+    /// Esc while the window holds the focus for the block being edited.
+    fn finish_edit(&mut self) {
+        if self.held_keys.iter().any(|(_, at)| at.elapsed() < HELD_KEY_LIFETIME) {
+            // After the keys before it.
+            self.key_away(&SharedString::from(slint::platform::Key::Escape), false);
+        } else {
+            self.request_edit(None, None);
+        }
     }
 
     fn key_action(&mut self, i: usize, cmd: &str, text: &str, cursor: usize, anchor: usize) -> EditResult {
@@ -409,6 +513,7 @@ impl Editor {
             }
         };
         self.editing = None;
+        self.images.clear();
         self.doc = Document::parse(&text);
         self.saved_text = text;
         self.path = Some(std::path::absolute(&path).unwrap_or(path));
@@ -604,7 +709,7 @@ fn styled(md: &str, plain: &str) -> StyledText {
     StyledText::from_markdown(md).unwrap_or_else(|_| StyledText::from_plain_text(plain))
 }
 
-fn to_ui(r: render::Rendered, src: &str, base: &Path) -> Block {
+fn to_ui(r: render::Rendered, src: &str, image: Option<(slint::Image, bool, SharedString)>) -> Block {
     let (kind, level) = ui_kind(r.kind);
     let lines: Vec<Line> = r
         .lines
@@ -639,16 +744,7 @@ fn to_ui(r: render::Rendered, src: &str, base: &Path) -> Block {
         })
         .collect();
 
-    let (image, has_image, caption) = match &r.image {
-        Some((url, alt)) => match load_image(url, base) {
-            Ok(img) => (img, true, SharedString::new()),
-            Err(why) => {
-                let alt = if alt.is_empty() { "image" } else { alt.as_str() };
-                (slint::Image::default(), false, format!("{alt} — {why}").into())
-            }
-        },
-        None => (slint::Image::default(), false, SharedString::new()),
-    };
+    let (image, has_image, caption) = image.unwrap_or_default();
 
     Block {
         kind,
@@ -663,19 +759,6 @@ fn to_ui(r: render::Rendered, src: &str, base: &Path) -> Block {
         has_image,
         caption,
     }
-}
-
-fn load_image(url: &str, base: &Path) -> Result<slint::Image, String> {
-    let local = match url.strip_prefix("file://") {
-        Some(rest) => rest,
-        None if url.contains("://") || url.starts_with("data:") => {
-            return Err(format!("remote images are not loaded ({url})"));
-        }
-        None => url,
-    };
-    let path = PathBuf::from(percent_decode(local));
-    let full = if path.is_absolute() { path } else { base.join(path) };
-    slint::Image::load_from_path(&full).map_err(|_| format!("can't load {}", full.display()))
 }
 
 /// The largest char boundary of `s` at or before `pos`.
@@ -766,7 +849,8 @@ fn monospace_family() -> Option<String> {
     (!first.is_empty()).then(|| first.to_owned())
 }
 
-/// Window events that need winit: dropped files, and the pointer position.
+/// Window events that need winit: dropped files, the mouse wheel, the scale,
+/// and the pointer position.
 fn install_window_events(app: &App, editor: Rc<RefCell<Editor>>) {
     use slint::winit_030::winit::event::WindowEvent;
     use slint::winit_030::{EventResult, WinitWindowAccessor};
@@ -782,6 +866,27 @@ fn install_window_events(app: &App, editor: Rc<RefCell<Editor>>) {
                 pointer_in.set(Some(slint::LogicalPosition::new((position.x / scale) as f32, (position.y / scale) as f32)));
             }
             WindowEvent::CursorLeft { .. } => pointer_in.set(None),
+            // Before the list scrolls, and may drop the text field that has the
+            // focus along with the keys: see park-focus.
+            WindowEvent::MouseWheel { .. } => {
+                if let Some(ui) = weak.upgrade() {
+                    ui.invoke_park_focus();
+                }
+            }
+            // The scale is known once the window is first sized (an image in a
+            // file opened from the command line was decoded before that), and
+            // changes on a screen with another scale. Look after Slint has seen
+            // the event.
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                let editor = Rc::downgrade(&editor);
+                slint::Timer::single_shot(Duration::ZERO, move || {
+                    if let Some(ed) = editor.upgrade()
+                        && let Ok(ed) = ed.try_borrow()
+                    {
+                        ed.rescaled();
+                    }
+                });
+            }
             WindowEvent::HoveredFile(_) => {
                 if let Some(ui) = weak.upgrade() {
                     ui.set_drop_hover(true);
@@ -904,6 +1009,16 @@ fn write_setting(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
 }
 
 fn wire(app: &App, editor: &Rc<RefCell<Editor>>) {
+    // Images load on worker threads. The editor may be busy (in a file dialog,
+    // say) when some arrive: they're shown on a later poll then.
+    let ed = Rc::downgrade(editor);
+    editor.borrow().images.set_on_ready(move || {
+        if let Some(ed) = ed.upgrade()
+            && let Ok(ed) = ed.try_borrow()
+        {
+            ed.images_ready();
+        }
+    });
     let ed = editor.clone();
     app.on_edited(move |i, text| ed.borrow_mut().edited(i as usize, &text));
     let ed = editor.clone();
@@ -938,9 +1053,26 @@ fn wire(app: &App, editor: &Rc<RefCell<Editor>>) {
     let ed = editor.clone();
     app.on_confirm_choice(move |choice| ed.borrow_mut().confirm(choice));
     let ed = editor.clone();
-    app.on_finish_edit(move || ed.borrow_mut().request_edit(None, None));
+    app.on_finish_edit(move || ed.borrow_mut().finish_edit());
     let ed = editor.clone();
     app.on_key_away(move |text, command| ed.borrow_mut().key_away(&text, command));
+    let ed = editor.clone();
+    let weak = app.as_weak();
+    app.on_edit_focused(move || {
+        let keys = ed.borrow_mut().take_held_keys();
+        if keys.is_empty() {
+            return;
+        }
+        // Not from inside this callback: Slint calls it while it updates the UI.
+        let weak = weak.clone();
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            if let Some(ui) = weak.upgrade() {
+                for text in keys {
+                    ui.window().dispatch_event(slint::platform::WindowEvent::KeyPressed { text });
+                }
+            }
+        });
+    });
     let ed = editor.clone();
     app.window().on_close_requested(move || {
         let Ok(mut ed) = ed.try_borrow_mut() else { return CloseRequestResponse::KeepWindowShown };
@@ -951,6 +1083,7 @@ fn wire(app: &App, editor: &Rc<RefCell<Editor>>) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     select_backend();
     let app = App::new()?;
+    app.set_version(env!("CARGO_PKG_VERSION").into());
     if let Some(mono) = monospace_family() {
         app.global::<Theme>().set_mono(mono.into());
     }

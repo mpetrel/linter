@@ -13,18 +13,23 @@ writing at the end.
 
 The *Theme* menu at the right of the toolbar switches between the light and dark theme.
 The choice is remembered in `~/.config/linter/settings` (`%APPDATA%\linter\settings` on
-Windows, `~/Library/Application Support/linter/settings` on macOS).
+Windows, `~/Library/Application Support/linter/settings` on macOS). *About* shows the
+version and the Slint attribution.
 
 ```sh
 cargo run --release -- path/to/file.md     # or start without a file
 cargo run --release -- examples/sample.md  # a tour of what's supported
 ```
 
+Building needs a C compiler (for libwebp) and, on Linux, the OpenSSL headers
+(`openssl-devel` on Fedora, `libssl-dev` on Debian and Ubuntu).
+
 ## Files
 
 - **Open:** `Ctrl+O`, the *Open…* button, or drag a file onto the window.
 - **Save:** `Ctrl+S`. **Save As:** `Ctrl+Shift+S`.
-- You're asked before unsaved changes are discarded (on open or close).
+- You're asked before unsaved changes are discarded (on open or close): `Enter` saves,
+  `Esc` cancels.
 - Opening and saving a file without edits writes it back byte for byte. Only the
   blocks you edit are reformatted. LF or CRLF line endings and a UTF-8 byte order mark
   are kept. A file that mixes line endings is written back unchanged until you edit it;
@@ -63,8 +68,31 @@ becomes part of the list.
 Headings (ATX and setext), paragraphs, emphasis, strong, strike-through, inline code,
 links (including reference links), `<u>` underline, bullet/ordered/task lists, nesting,
 block quotes, fenced and indented code, tables with column alignment, horizontal rules,
-local images (paths relative to the file), YAML front matter, footnotes. HTML blocks and
-link definitions are shown as raw text.
+images, YAML front matter, footnotes. HTML blocks and link definitions are shown as raw
+text.
+
+### Images
+
+An image on its own line (`![alt](path-or-url)`) is shown in place of the block:
+
+- **Formats:** PNG, JPEG, GIF, WebP, SVG, BMP, ICO, TIFF, TGA, PNM and QOI. Animated GIF
+  and WebP show their first frame. JPEG photos are turned upright by their Exif
+  orientation. SVG (and `.svgz`) up to 8 MB. AVIF, HEIC and JPEG XL aren't supported,
+  and say so.
+- **Files:** paths are relative to the Markdown file (to the current directory for a file
+  that hasn't been saved yet). `file://` links and `%20`-style escapes work too.
+- **Web:** `http://` and `https://` images are downloaded, at most 64 MB each, using the
+  system's certificates. The proxy comes from `HTTPS_PROXY` / `ALL_PROXY` or, on Windows,
+  the system proxy setting; images from this machine (`localhost`, `127.0.0.1`) bypass
+  it. Downloads aren't kept on disk: opening the file again downloads them again.
+
+Images load in the background: a block shows *loading…* until its image is ready, or the
+reason it can't be shown. Images wider than the column can show (at the screen's scale,
+and at least 2×) are scaled down while they're decoded, so large photos are quick to show
+and don't use much memory; on a screen with a larger scale they're decoded again.
+Decoders: zune-jpeg, or jpeg-decoder for photos at least twice too large, since it can
+decode at 1/2, 1/4 or 1/8 size; libwebp, about 4× faster than the pure Rust WebP decoder
+and able to scale while decoding; the `image` crate for the rest; Slint (resvg) for SVG.
 
 Several spaces in a row inside a line are kept and shown as typed. Markdown keeps them
 too, but HTML viewers such as GitHub show them as one space; use `&nbsp;` for a gap
@@ -80,7 +108,8 @@ make a line break).
 - **Input methods on Linux:** through XWayland, an IBus input method (for example Rime
   or Pinyin) can drop or delay keys, such as repeated spaces. `LINTER_WAYLAND=1` uses
   the Wayland input-method support instead.
-- Links aren't opened on click (a click edits the block). Remote images aren't downloaded.
+- Links aren't opened on click (a click edits the block). An image inside a line of text
+  is shown as its alt text.
 - Undo (`Ctrl+Z`) works within the block being edited, not across blocks. It starts over
   when that block scrolls out of view and back.
 - Tables and code blocks are edited as plain text.
@@ -89,6 +118,7 @@ make a line break).
 
 - `src/doc.rs`: splits a file into blocks, keeps the whitespace between them, and
   re-splits edited text.
+- `src/images.rs`: loads, downloads and decodes images on worker threads.
 - `src/render.rs`: turns a block into display data. Inline Markdown is re-emitted in the
   subset Slint's `StyledText` supports.
 - `src/ops.rs`: keyboard commands (Enter, merge, heading levels, list indent, …) as pure
@@ -107,12 +137,21 @@ cargo test                                      # unit tests
 SHOT_DIR=/tmp/shots cargo test shots::shots -- --exact --ignored   # headless UI run
 cargo test shots::shots_review -- --exact --ignored               # UI regression checks
 cargo test shots::shots_large_document -- --exact --ignored       # editing a long document
-SHOT_DIR=/tmp/shots cargo test shots::shots_theme -- --exact --ignored   # theme menu, dark theme
+cargo test shots::shots_mixed_heights -- --exact --ignored        # blocks of different heights
+SHOT_DIR=/tmp/shots cargo test shots::shots_theme -- --exact --ignored   # theme menu, dark theme, About
+SHOT_DIR=/tmp/shots cargo test shots::shots_images -- --exact --ignored  # images: formats, web, errors
 ```
 
 The ignored `shots*` tests drive the real UI with simulated clicks and keys through
 Slint's software renderer, and write PNG screenshots (they need ImageMagick's `magick`).
 Run each one on its own, as shown, because each sets up its own Slint platform.
+
+## License note
+
+Slint is used under the [Slint Royalty-free Desktop, Mobile, and Web Applications
+License 2.0](https://github.com/slint-ui/slint/blob/master/LICENSES/LicenseRef-Slint-Royalty-free-2.0.md).
+It asks for the `AboutSlint` widget in an About dialog that's reachable from the top
+level menu, so keep it in the dialog behind the toolbar's *About* button.
 
 ## Windows installer
 
@@ -125,9 +164,12 @@ This cross-compiles from Linux and writes two files to `target/windows/`:
 - `linter-<version>-setup.exe` installs to Program Files with a Start menu shortcut and
   an uninstaller (listed under Settings → Apps). Optionally, it adds a desktop shortcut
   and lists linter under *Open with* for `.md` files, without changing the default
-  program.
+  program. Running a newer `setup.exe` updates an existing install in its folder and
+  keeps the settings; it asks you to close linter first if it's running. Bump `version`
+  in `Cargo.toml` for each release so Settings → Apps shows which one is installed.
+  Uninstalling asks whether to delete your settings too, and keeps them by default.
 - `linter-<version>-windows-x64.zip` holds the same files, to run without installing.
 
 It needs the Rust target (`rustup target add x86_64-pc-windows-gnu`), MinGW-w64
-(`mingw64-gcc` on Fedora) and NSIS (`makensis`). The app runs on 64-bit Windows 10 or
+(`mingw64-gcc` on Fedora, which also builds libwebp) and NSIS (`makensis`). The app runs on 64-bit Windows 10 or
 later.

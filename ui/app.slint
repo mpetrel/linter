@@ -4,7 +4,7 @@
 // one (or moving into it with the arrow keys) swaps it for its raw Markdown
 // in place, so `## Title` can become `### Title` by typing another `#`.
 
-import { ListView, Palette } from "std-widgets.slint";
+import { AboutSlint, ListView, Palette } from "std-widgets.slint";
 
 export enum BlockKind { empty, paragraph, heading, code, quote, list, rule, table, image, raw }
 
@@ -86,6 +86,28 @@ export global Theme {
     }
 }
 
+// Icons are drawn as paths, not text: symbols such as ✓ or 🖼 are missing from
+// Segoe UI, the default font on Windows, and show there as a box.
+component CheckMark inherits Path {
+    width: 12px;
+    height: 12px;
+    viewbox-width: 12;
+    viewbox-height: 12;
+    commands: "M 2.25 6.25 L 5 9 L 9.75 3.25";
+    stroke-width: 1.75px;
+    stroke-line-cap: round;
+}
+
+component PictureIcon inherits Path {
+    width: 16px;
+    height: 14px;
+    viewbox-width: 16;
+    viewbox-height: 14;
+    commands: "M 1.5 1.5 L 14.5 1.5 L 14.5 12.5 L 1.5 12.5 Z M 1.5 10 L 5.5 6 L 9 9.5 L 11 7.5 L 14.5 11 M 10.5 4.5 A 1 1 0 1 0 12.5 4.5 A 1 1 0 1 0 10.5 4.5";
+    stroke-width: 1.25px;
+    stroke-line-cap: round;
+}
+
 component FlowLines inherits VerticalLayout {
     in property <[Line]> lines;
     in property <color> color: Theme.ink;
@@ -113,13 +135,9 @@ component FlowLines inherits VerticalLayout {
                 border-width: line.task == 2 ? 0px : 1.5px;
                 border-color: Theme.muted;
                 background: line.task == 2 ? Theme.accent-fill : Theme.page;
-                if line.task == 2: Text {
-                    text: "✓";
-                    color: Theme.on-accent;
-                    font-size: 12px;
-                    font-weight: 700;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+                if line.task == 2: CheckMark {
+                    stroke: Theme.on-accent;
+                    stroke-width: 2px;
                 }
             }
         }
@@ -232,15 +250,17 @@ component TableView {
     }
 }
 
-// How a block that starts or resumes editing reports its caret to the window.
-enum Reveal {
-    // Scroll the caret into view now.
-    now,
-    // Scroll it into view after the list has laid out: a row is created while
-    // the list lays out, and a scroll from there would be overwritten.
-    later,
-    // Don't scroll: the block came back into view because the user scrolled.
-    quiet,
+// What the window asks the row of the block being edited. The list only
+// creates the rows in view and places them by estimated heights, so a row's
+// position is only meaningful while it exists: rather than remember where the
+// block was, the window asks, and a missing answer means it has no row.
+enum Ask {
+    // Take the focus and scroll the caret into view.
+    reveal,
+    // The list stopped moving: take the focus back if that doesn't scroll.
+    settle,
+    // The list moved: only answer, so the window knows the row is still there.
+    probe,
 }
 
 component BlockView {
@@ -255,16 +275,29 @@ component BlockView {
     in property <int> caret-seq: -1;
     in property <int> saved-caret;
     in property <int> saved-anchor;
-    // Whether the block being edited is in view; only read while editing.
-    in property <bool> in-view: true;
+    // The window's question to the block being edited; `ask-seq` changes with
+    // each one.
+    in property <int> ask-seq;
+    in property <Ask> ask;
+    // Whether taking the focus now would leave the list where it is.
+    in property <bool> resumable;
+    out property <length> input-top: input.y;
+    out property <length> input-height: input.height;
 
     // cursor: -2 keep the cursor where the click put it, 0 start, -1 end
     callback request-edit(index: int, cursor: int);
     callback edited(index: int, text: string);
     callback key-action(index: int, command: string, text: string, cursor: int, anchor: int) -> EditResult;
     callback release-focus();
-    // While editing: the caret's byte offsets and its top, relative to this block.
-    callback caret-moved(caret: int, anchor: int, caret-y: length, line-h: length, reveal: Reveal);
+    // While editing: the caret's byte offsets and its top, relative to this
+    // block, and whether to scroll it into view.
+    callback caret-moved(caret: int, anchor: int, caret-y: length, line-h: length, scroll: bool);
+    // While editing: the window's question was answered.
+    callback answered();
+    // Created while being edited.
+    callback created();
+    // While editing: the text field got the focus.
+    callback focused();
 
     property <bool> mono: data.kind == BlockKind.code || data.kind == BlockKind.raw || data.kind == BlockKind.table;
     property <length> font-size: data.kind == BlockKind.heading ? Theme.heading-size(data.level) : root.mono ? Theme.mono-size : Theme.body;
@@ -275,21 +308,28 @@ component BlockView {
     property <string> src: data.source;
     // Changes whenever the editor (re)starts editing this block.
     property <int> sync: root.editing ? root.edit-seq : -1;
-    property <Reveal> reveal: Reveal.now;
+    // The edit session whose caret this text field holds: until then, its
+    // caret moves aren't reported.
+    property <int> started-seq: -1;
+    property <bool> scroll-to-caret: true;
 
     height: root.editing ? max(input.preferred-height, root.line-h) + root.pad-top + root.pad-bottom : view.preferred-height;
 
     init => {
         input.text = root.data.source;
         if root.editing {
-            // Created while being edited: either the editor moved here (a new
-            // session), or the block scrolled back into view.
-            root.start-editing(root.caret-seq == root.edit-seq ? Reveal.quiet : Reveal.later);
+            // Created while being edited: the window brought the block into
+            // view, or the user scrolled back to it. Put the caret back, but
+            // leave the focus to the window, which asks once the list settles.
+            if root.caret-seq == root.edit-seq {
+                root.start-editing(false, false);
+            }
+            root.created();
         }
     }
     changed sync => {
         if root.editing {
-            root.start-editing(Reveal.now);
+            root.start-editing(true, true);
         } else {
             root.stop-editing();
         }
@@ -299,35 +339,37 @@ component BlockView {
             input.text = root.src;
         }
     }
-    // Scrolled back into view before the list dropped this row.
-    changed in-view => {
-        if root.in-view && root.editing && !input.has-focus && root.caret-seq == root.edit-seq {
-            root.start-editing(Reveal.quiet);
+    changed ask-seq => {
+        if root.editing {
+            if root.ask == Ask.reveal {
+                root.start-editing(true, true);
+            } else if root.ask == Ask.settle && !input.has-focus && root.resumable {
+                root.start-editing(true, false);
+            }
+            root.answered();
         }
     }
 
-    function start-editing(reveal: Reveal) {
+    // Puts the caret of this edit session in the text field: the one the
+    // window saved if the session already had one, or else the one asked for.
+    function start-editing(focus: bool, scroll: bool) {
         if input.text != root.data.source {
             input.text = root.data.source;
         }
-        root.reveal = reveal;
-        if reveal == Reveal.quiet {
-            // Put the caret back before taking the focus: a focused text field
-            // scrolls to its caret.
+        let resuming = root.caret-seq == root.edit-seq;
+        root.started-seq = root.edit-seq;
+        root.scroll-to-caret = scroll;
+        if resuming && !input.has-focus {
             input.set-selection-offsets(root.saved-anchor, root.saved-caret);
-            input.focus();
-        } else {
-            if !input.has-focus {
-                input.focus();
-            }
-            if root.cursor-request >= 0 {
-                // Fires cursor-position-changed, which reports the caret.
-                input.set-selection-offsets(root.cursor-request, root.cursor-request);
-            } else {
-                root.report-caret();
-            }
         }
-        root.reveal = Reveal.now;
+        if focus && !input.has-focus {
+            input.focus();
+        }
+        if !resuming && root.cursor-request >= 0 {
+            input.set-selection-offsets(root.cursor-request, root.cursor-request);
+        }
+        root.report-caret();
+        root.scroll-to-caret = true;
     }
 
     function stop-editing() {
@@ -341,7 +383,7 @@ component BlockView {
     }
 
     function report-caret() {
-        root.caret-moved(input.cursor-position-byte-offset, input.anchor-position-byte-offset, input.y + root.caret-y, root.line-h, root.reveal);
+        root.caret-moved(input.cursor-position-byte-offset, input.anchor-position-byte-offset, input.y + root.caret-y, root.line-h, root.scroll-to-caret);
     }
 
     function act(command: string) -> EventResult {
@@ -452,10 +494,19 @@ component BlockView {
                 background: Theme.code-bg;
                 HorizontalLayout {
                     padding: 14px;
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: start;
+                        padding-top: 2px;
+                        PictureIcon {
+                            stroke: Theme.soft;
+                        }
+                    }
                     Text {
-                        text: "🖼  " + data.caption;
+                        text: data.caption;
                         color: Theme.soft;
                         wrap: word-wrap;
+                        horizontal-stretch: 1;
                     }
                 }
             }
@@ -491,13 +542,21 @@ component BlockView {
             }
             cursor-position-changed(pos) => {
                 root.caret-y = pos.y;
-                if root.editing {
+                if root.editing && root.started-seq == root.edit-seq {
                     root.report-caret();
                 }
             }
             changed has-focus => {
                 if self.has-focus && !root.editing {
                     root.request-edit(root.index, -2);
+                } else if self.has-focus {
+                    if root.started-seq != root.edit-seq {
+                        // Clicked before the window brought the block into
+                        // view: the caret is where the click put it.
+                        root.started-seq = root.edit-seq;
+                        root.report-caret();
+                    }
+                    root.focused();
                 }
             }
             key-pressed(e) => {
@@ -592,38 +651,33 @@ component BlockRow {
     in property <int> caret-seq: -1;
     in property <int> saved-caret;
     in property <int> saved-anchor;
-    in property <bool> in-view: true;
+    in property <int> ask-seq;
+    in property <Ask> ask;
+    // The part of the list in view, in list content coordinates.
+    in property <length> view-top;
+    in property <length> view-height;
 
     callback request-edit(index: int, cursor: int);
     callback edited(index: int, text: string);
     callback key-action(index: int, command: string, text: string, cursor: int, anchor: int) -> EditResult;
     callback release-focus();
-    // Positions are in list content coordinates.
-    callback caret-moved(index: int, caret: int, anchor: int, caret-y: length, line-h: length, reveal: Reveal);
-    callback block-moved(index: int, top: length, height: length);
+    // `caret-y` is in list content coordinates, valid only until the list
+    // lays out again.
+    callback caret-moved(index: int, caret: int, anchor: int, caret-y: length, line-h: length, scroll: bool);
+    callback answered(index: int);
+    callback created(index: int);
+    callback focused(index: int);
     callback click-blank();
     callback click-below();
 
     property <length> pad-top: root.first ? 36px : 0px;
     property <length> pad-bottom: root.last ? 160px : 0px;
-    property <length> block-height: block.height;
     height: root.pad-top + block.height + root.pad-bottom;
 
-    changed y => {
-        root.report-position();
-    }
-    changed block-height => {
-        root.report-position();
-    }
-    changed editing => {
-        root.report-position();
-    }
-
-    function report-position() {
-        if root.editing {
-            root.block-moved(root.index, root.y + root.pad-top, block.height);
-        }
-    }
+    // A focused text field scrolls the list to show all of itself, unless it's
+    // taller than the view.
+    property <length> input-top: root.y + root.pad-top + block.input-top;
+    property <bool> resumable: block.input-height > root.view-height || (root.input-top >= root.view-top && root.input-top + block.input-height <= root.view-top + root.view-height);
 
     TouchArea {
         mouse-cursor: MouseCursor.text;
@@ -649,7 +703,9 @@ component BlockRow {
         caret-seq: root.caret-seq;
         saved-caret: root.saved-caret;
         saved-anchor: root.saved-anchor;
-        in-view: root.in-view;
+        ask-seq: root.ask-seq;
+        ask: root.ask;
+        resumable: root.resumable;
         request-edit(index, cursor) => {
             root.request-edit(index, cursor);
         }
@@ -662,9 +718,17 @@ component BlockRow {
         release-focus => {
             root.release-focus();
         }
-        caret-moved(caret, anchor, caret-y, line-h, reveal) => {
-            root.report-position();
-            root.caret-moved(root.index, caret, anchor, root.y + root.pad-top + caret-y, line-h, reveal);
+        caret-moved(caret, anchor, caret-y, line-h, scroll) => {
+            root.caret-moved(root.index, caret, anchor, root.y + root.pad-top + caret-y, line-h, scroll);
+        }
+        answered => {
+            root.answered(root.index);
+        }
+        created => {
+            root.created(root.index);
+        }
+        focused => {
+            root.focused(root.index);
         }
     }
 }
@@ -729,13 +793,11 @@ component MenuEntry inherits Rectangle {
         padding-left: 6px;
         padding-right: 14px;
         spacing: 4px;
-        Text {
+        Rectangle {
             width: 20px;
-            text: root.checked ? "✓" : "";
-            color: Theme.accent;
-            font-size: 13px;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+            if root.checked: CheckMark {
+                stroke: Theme.accent;
+            }
         }
         Text {
             text: root.text;
@@ -847,6 +909,9 @@ export component App inherits Window {
     in property <bool> confirm-open;
     in property <string> confirm-text;
     in property <bool> drop-hover;
+    // Shown in the About dialog.
+    in property <string> version;
+    out property <bool> about-open;
 
     callback edited(index: int, text: string);
     callback key-action(index: int, command: string, text: string, cursor: int, anchor: int) -> EditResult;
@@ -867,6 +932,8 @@ export component App inherits Window {
     // Any other key then: types `text` into that block if it's text and no
     // modifier (`command`) is held. Returns whether the key was used.
     callback key-away(text: string, command: bool) -> bool;
+    // The text field of the block being edited got the focus (back).
+    callback edit-focused();
 
     // The caret of edit session `caret-seq`, saved as the block being edited
     // reports it, so that it can be put back when that block is created again
@@ -874,18 +941,33 @@ export component App inherits Window {
     in-out property <int> caret-seq: -1;
     in-out property <int> saved-caret;
     in-out property <int> saved-anchor;
-    // Where the block being edited (and its caret) last was, in list content
-    // coordinates, for edit session `block-seq`.
-    property <int> block-seq: -1;
-    property <length> block-top;
-    property <length> block-height;
-    property <length> caret-top;
-    property <length> caret-height;
-    property <bool> editing-in-view: root.editing-index >= 0 && root.block-seq == root.edit-seq && root.block-top + root.block-height > -sv.content-y && root.block-top < -sv.content-y + sv.visible-height;
-    property <bool> reveal-pending;
-    property <int> reveal-tries;
     property <length> column-x: max(80px, (sv.visible-width - Theme.column) / 2);
     property <length> column-width: min(Theme.column, sv.visible-width - 160px);
+
+    // The list only creates the rows in view, so the block being edited has no
+    // text field while it's scrolled away, and a text field that is dropped
+    // while it has the focus takes the keys with it. So the window holds the
+    // focus whenever the list may move, and asks the block's row, if there is
+    // one, to take it back (see Ask). Keys the window gets meanwhile go to
+    // key-away.
+    property <int> ask-seq;
+    property <Ask> sent-ask;
+    // The edit session `sent-ask` was asked in.
+    property <int> sent-edit-seq;
+    property <bool> answered;
+    property <bool> ask-pending;
+    property <Ask> next-ask;
+    property <bool> check-pending;
+    // Asked to reveal the block, it had no row: the list is scrolling to it.
+    property <bool> want-reveal;
+    // Reveals that went unanswered since `bring-back`. The list places rows
+    // by estimated heights, so a row it creates for a reveal may be gone again
+    // before it's asked; after a few tries the window keeps the focus, and
+    // the next key tries again.
+    property <int> reveal-tries;
+    property <length> view-height: sv.visible-height;
+    // A dialog keeps the focus while it's open.
+    property <bool> modal-open: root.about-open || root.confirm-open;
 
     // A new document starts at its top.
     public function scroll-to-top() {
@@ -896,48 +978,117 @@ export component App inherits Window {
     // into the list first if it's out of view.
     public function bring-back() {
         root.reveal-tries = 0;
-        root.reveal-pending = true;
+        root.ask(Ask.reveal);
     }
 
-    // The list only creates the rows in view, so the block being edited loses
-    // its text field when it scrolls away. Keep the keys working meanwhile.
-    changed editing-in-view => {
-        if !root.editing-in-view && root.editing-index >= 0 && root.block-seq == root.edit-seq {
+    // Before the list may move (Rust calls this on a mouse wheel event). The
+    // block takes the focus back once the list stops, even if it didn't move.
+    public function park-focus() {
+        if root.editing-index >= 0 {
             fs.focus();
+            root.settle();
         }
     }
-    // A new edit session: once the list has laid out, make sure its block is in
-    // view, since it may not have a row yet (moving down from the last line on
-    // screen, say).
+
+    // Asks the row of the block being edited `a`, on the next tick. A reveal
+    // waiting to be asked isn't replaced by another question, nor a settle by
+    // a probe.
+    function ask(a: Ask) {
+        if root.editing-index < 0 {
+            return;
+        }
+        if root.ask-pending && (root.next-ask == Ask.reveal || (root.next-ask == Ask.settle && a == Ask.probe)) {
+            return;
+        }
+        root.next-ask = a;
+        root.ask-pending = true;
+    }
+
+    pure function revealing() -> bool {
+        return root.want-reveal || (root.ask-pending && root.next-ask == Ask.reveal) || (root.check-pending && root.sent-ask == Ask.reveal);
+    }
+
+    // A new edit session: make sure its block is in view, since it may not
+    // have a row yet (moving down from the last line on screen, say).
     changed edit-seq => {
+        root.want-reveal = false;
         if root.editing-index >= 0 {
             root.bring-back();
         }
     }
+    changed view-height => {
+        root.list-moved();
+    }
 
-    reveal-timer := Timer {
-        interval: 1ms;
-        running: root.reveal-pending;
-        triggered => {
-            root.reveal-pending = false;
-            root.reveal-step();
+    // The list moved, or its view changed size.
+    function list-moved() {
+        root.settle();
+        // A text field that had the focus is gone if its row is (the scroll
+        // bar moved the list, say), and the keys with it: ask whether the row
+        // is there, and hold the focus if it isn't.
+        if !root.revealing() {
+            root.ask(Ask.probe);
         }
     }
 
-    function reveal-step() {
-        if root.editing-index < 0 {
-            return;
+    function settle() {
+        if root.editing-index >= 0 {
+            settle-timer.start();
+            settle-timer.restart();
         }
-        if root.editing-in-view && root.caret-seq == root.edit-seq {
-            root.scroll-into-view(root.caret-top, root.caret-height);
-            return;
+    }
+
+    // The list stopped moving.
+    settle-timer := Timer {
+        interval: 80ms;
+        running: false;
+        triggered => {
+            self.stop();
+            if root.editing-index >= 0 && !root.revealing() && !root.modal-open {
+                root.ask(Ask.settle);
+            }
         }
-        // No row for the block yet, or it hasn't reported its caret: scroll the
-        // list to it and look again after the next layout.
-        if root.reveal-tries < 4 {
-            root.reveal-tries += 1;
-            sv.ensure-row-visible(root.editing-index, ScrollBehavior.instant);
-            root.reveal-pending = true;
+    }
+
+    // Asks on one tick, after any layout in between, and looks at the answer
+    // on the next: rows answer from a change handler.
+    ask-timer := Timer {
+        interval: 1ms;
+        running: root.ask-pending || root.check-pending;
+        triggered => {
+            root.ask-step();
+        }
+    }
+
+    function ask-step() {
+        if root.check-pending {
+            root.check-pending = false;
+            if !root.answered && root.editing-index >= 0 && root.sent-edit-seq == root.edit-seq && !root.modal-open {
+                if root.sent-ask != Ask.reveal {
+                    // No row: hold the focus for it.
+                    fs.focus();
+                } else if root.reveal-tries < 4 {
+                    // No row: scroll the list to the block. Its row asks for
+                    // another try when it's created.
+                    root.reveal-tries += 1;
+                    root.want-reveal = true;
+                    sv.ensure-row-visible(root.editing-index, ScrollBehavior.instant);
+                } else {
+                    root.want-reveal = false;
+                    fs.focus();
+                }
+            }
+        }
+        if root.ask-pending {
+            root.ask-pending = false;
+            // Not while a dialog is open: closing it asks again.
+            if root.editing-index >= 0 && !root.modal-open {
+                root.sent-ask = root.next-ask;
+                root.sent-edit-seq = root.edit-seq;
+                root.answered = false;
+                root.ask-seq += 1;
+                root.check-pending = true;
+            }
         }
     }
 
@@ -948,6 +1099,35 @@ export component App inherits Window {
 
     focus-root => {
         fs.focus();
+    }
+
+    // While a dialog is open, the window takes the focus from the block being
+    // edited, so that an input method can't type into it behind the dialog.
+    // On close, the block takes it back where it is, without scrolling to it.
+    function show-about() {
+        root.about-open = true;
+        fs.focus();
+    }
+
+    function close-about() {
+        root.about-open = false;
+        root.dialog-closed();
+    }
+
+    function dialog-closed() {
+        if !root.modal-open {
+            root.ask(Ask.settle);
+        }
+    }
+
+    changed confirm-open => {
+        if root.confirm-open {
+            // One dialog at a time.
+            root.about-open = false;
+            fs.focus();
+        } else {
+            root.dialog-closed();
+        }
     }
 
     property <BlockKind> editing-kind: root.editing-index >= 0 ? root.blocks[root.editing-index].kind : BlockKind.empty;
@@ -968,6 +1148,22 @@ export component App inherits Window {
 
     fs := FocusScope {
         capture-key-pressed(e) => {
+            // The dialogs are modal. Unsaved changes: Esc cancels, Enter saves.
+            if root.confirm-open {
+                if e.text == Key.Escape {
+                    root.confirm-choice(2);
+                } else if e.text == Key.Return {
+                    root.confirm-choice(0);
+                }
+                return EventResult.accept;
+            }
+            // About: Esc or Enter closes it, other keys do nothing.
+            if root.about-open {
+                if e.text == Key.Escape || e.text == Key.Return {
+                    root.close-about();
+                }
+                return EventResult.accept;
+            }
             if e.modifiers.control && !e.modifiers.alt {
                 if e.text == "s" || e.text == "S" {
                     if e.modifiers.shift {
@@ -984,8 +1180,8 @@ export component App inherits Window {
             }
             return EventResult.reject;
         }
-        // Only reached with nothing else focused: the block being edited is
-        // scrolled out of view, or nothing is being edited.
+        // Only reached with nothing else focused: the window holds the focus
+        // for the block being edited (see park-focus), or nothing is edited.
         key-pressed(e) => {
             if !self.has-focus || root.editing-index < 0 {
                 return EventResult.reject;
@@ -1042,6 +1238,12 @@ export component App inherits Window {
                             root.choose-theme(dark);
                         }
                     }
+                    ToolButton {
+                        text: "About";
+                        clicked => {
+                            root.show-about();
+                        }
+                    }
                 }
                 Rectangle {
                     y: parent.height - 1px;
@@ -1069,6 +1271,7 @@ export component App inherits Window {
                     mouse-drag-pan-enabled: false;
                     changed content-y => {
                         root.list-scrolled();
+                        root.list-moved();
                     }
 
                     for block[i] in root.blocks: BlockRow {
@@ -1085,7 +1288,10 @@ export component App inherits Window {
                         caret-seq: root.caret-seq;
                         saved-caret: root.saved-caret;
                         saved-anchor: root.saved-anchor;
-                        in-view: root.editing-in-view;
+                        ask-seq: root.ask-seq;
+                        ask: root.sent-ask;
+                        view-top: -sv.content-y;
+                        view-height: sv.visible-height;
                         request-edit(index, cursor) => {
                             root.request-edit(index, cursor);
                         }
@@ -1098,26 +1304,41 @@ export component App inherits Window {
                         release-focus => {
                             fs.focus();
                         }
-                        caret-moved(index, caret, anchor, caret-y, line-h, reveal) => {
+                        caret-moved(index, caret, anchor, caret-y, line-h, scroll) => {
                             if index != root.editing-index {
                                 return;
                             }
                             root.caret-seq = root.edit-seq;
                             root.saved-caret = caret;
                             root.saved-anchor = anchor;
-                            root.caret-top = caret-y;
-                            root.caret-height = line-h;
-                            if reveal == Reveal.now {
+                            if scroll {
                                 root.scroll-into-view(caret-y, line-h);
-                            } else if reveal == Reveal.later {
-                                root.bring-back();
                             }
                         }
-                        block-moved(index, top, height) => {
+                        answered(index) => {
                             if index == root.editing-index {
-                                root.block-seq = root.edit-seq;
-                                root.block-top = top;
-                                root.block-height = height;
+                                root.answered = true;
+                                if root.sent-ask == Ask.reveal {
+                                    root.want-reveal = false;
+                                }
+                            }
+                        }
+                        created(index) => {
+                            if index != root.editing-index {
+                                return;
+                            }
+                            // Asked before it existed, the row couldn't answer:
+                            // ask again.
+                            if root.want-reveal || (root.check-pending && root.sent-ask == Ask.reveal) {
+                                root.want-reveal = false;
+                                root.ask(Ask.reveal);
+                            } else if root.check-pending {
+                                root.ask(root.sent-ask);
+                            }
+                        }
+                        focused(index) => {
+                            if index == root.editing-index {
+                                root.edit-focused();
                             }
                         }
                         click-blank => {
@@ -1181,9 +1402,102 @@ export component App inherits Window {
             }
         }
 
+        // Slint is used under its royalty-free license, which asks for the
+        // AboutSlint widget in an About dialog reachable from the top level
+        // menu: the toolbar's About button.
+        if root.about-open: Rectangle {
+            background: Theme.scrim;
+            TouchArea {
+                clicked => {
+                    root.close-about();
+                }
+                // Don't scroll the document behind the dialog.
+                scroll-event(e) => {
+                    return EventResult.accept;
+                }
+            }
+            Rectangle {
+                width: min(380px, parent.width - 40px);
+                height: about.preferred-height;
+                background: Theme.page;
+                border-radius: 10px;
+                drop-shadow-blur: 24px;
+                drop-shadow-color: Theme.shadow;
+                // Clicks on the card don't close it.
+                TouchArea { }
+                about := VerticalLayout {
+                    padding: 24px;
+                    padding-bottom: 20px;
+                    spacing: 4px;
+                    HorizontalLayout {
+                        alignment: center;
+                        Image {
+                            source: @image-url("../assets/linter.png");
+                            width: 64px;
+                            height: 64px;
+                        }
+                    }
+                    Text {
+                        text: "linter";
+                        font-size: 20px;
+                        font-weight: 700;
+                        color: Theme.ink;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "Version \{root.version}";
+                        font-size: 13px;
+                        color: Theme.soft;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "A live-preview Markdown editor";
+                        font-size: 13px;
+                        color: Theme.soft;
+                        horizontal-alignment: center;
+                    }
+                    Rectangle {
+                        height: 17px;
+                        Rectangle {
+                            y: 12px;
+                            height: 1px;
+                            background: Theme.rule;
+                        }
+                    }
+                    AboutSlint {
+                        height: self.min-height;
+                    }
+                    Text {
+                        text: "Slint is used under the Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0.";
+                        font-size: 11px;
+                        color: Theme.muted;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                    }
+                    HorizontalLayout {
+                        alignment: center;
+                        padding-top: 14px;
+                        DialogButton {
+                            text: "Close";
+                            primary: true;
+                            clicked => {
+                                root.close-about();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Last, so that it shows above the About dialog.
         if root.confirm-open: Rectangle {
             background: Theme.scrim;
-            TouchArea { }
+            TouchArea {
+                // Don't scroll the document behind the dialog.
+                scroll-event(e) => {
+                    return EventResult.accept;
+                }
+            }
             Rectangle {
                 width: min(440px, parent.width - 40px);
                 height: dialog.preferred-height;

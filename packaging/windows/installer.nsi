@@ -33,8 +33,8 @@ SetCompressor /SOLID lzma
 
 Name "${APP} ${VERSION}"
 OutFile "${OUTFILE}"
+; An earlier install's folder is read in .onInit.
 InstallDir "$PROGRAMFILES64\${APP}"
-InstallDirRegKey HKLM "Software\${APP}" "InstallDir"
 RequestExecutionLevel admin
 ManifestDPIAware true
 BrandingText "${APP} ${VERSION}"
@@ -71,11 +71,38 @@ Function .onInit
     Abort
   ${EndIf}
   SetRegView 64
+  ; Update an earlier install in its own folder. InstallDirRegKey can't find
+  ; it: SetRegView doesn't apply to it, so this 32-bit installer would look in
+  ; the 32-bit registry view. A folder given with /D is kept.
+  ReadRegStr $0 HKLM "Software\${APP}" "InstallDir"
+  ${If} $0 != ""
+  ${AndIf} $INSTDIR == "$PROGRAMFILES64\${APP}"
+    StrCpy $INSTDIR $0
+  ${EndIf}
 FunctionEnd
 
 Function un.onInit
   SetRegView 64
 FunctionEnd
+
+; A running linter.exe can't be replaced or deleted, and it can't be opened
+; for writing either, so ask until it's closed. A silent run gives up.
+!macro WaitUntilClosed
+  ${Do}
+    ${IfNot} ${FileExists} "$INSTDIR\${EXE}"
+      ${Break}
+    ${EndIf}
+    ClearErrors
+    FileOpen $0 "$INSTDIR\${EXE}" a
+    ${IfNot} ${Errors}
+      FileClose $0
+      ${Break}
+    ${EndIf}
+    ${If} ${Cmd} `MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "${APP} is running. Close it, then click Retry." /SD IDCANCEL IDCANCEL`
+      Abort
+    ${EndIf}
+  ${Loop}
+!macroend
 
 ; The installer runs elevated. Starting the app through Explorer runs it as
 ; the signed-in user instead, so files it saves aren't owned by the
@@ -86,6 +113,7 @@ FunctionEnd
 
 Section "${APP} (required)" SecApp
   SectionIn RO
+  !insertmacro WaitUntilClosed
   SetOutPath "$INSTDIR"
   File "${STAGE}/${EXE}"
   File "${STAGE}/README.md"
@@ -153,6 +181,19 @@ SectionEnd
 !macroend
 
 Section "Uninstall"
+  !insertmacro WaitUntilClosed
+
+  ; The settings are in the user's profile and are kept unless asked, so
+  ; installing again brings them back. Only the signed-in user's are found.
+  ; The folder is removed only if nothing else is left in it.
+  ${If} ${FileExists} "$APPDATA\${APP}\settings"
+    ${If} ${Cmd} `MessageBox MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2 "Also delete your ${APP} settings?$\r$\n$\r$\nIf you keep them, installing ${APP} again brings them back." /SD IDNO IDYES`
+      Delete "$APPDATA\${APP}\settings"
+      Delete "$APPDATA\${APP}\.settings.*.linter-tmp"
+      RMDir "$APPDATA\${APP}"
+    ${EndIf}
+  ${EndIf}
+
   Delete "$INSTDIR\${EXE}"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\examples\sample.md"

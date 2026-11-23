@@ -26,6 +26,7 @@ impl Platform for TestPlatform {
 
 struct Harness {
     window: Rc<MinimalSoftwareWindow>,
+    app: slint::Weak<App>,
     dir: PathBuf,
 }
 
@@ -44,7 +45,12 @@ impl Harness {
         }
     }
 
+    /// A mouse wheel turn over the document. Parks the focus first, as the
+    /// winit event hook does in the app.
     fn scroll(&self, delta_y: f32) {
+        if let Some(app) = self.app.upgrade() {
+            app.invoke_park_focus();
+        }
         let position = LogicalPosition::new(300.0, 400.0);
         self.window.dispatch_event(WindowEvent::PointerScrolled { position, delta_x: 0.0, delta_y });
         self.settle();
@@ -79,10 +85,24 @@ impl Harness {
     }
 
     fn key(&self, text: impl Into<SharedString>) {
+        self.press(text);
+        self.settle();
+    }
+
+    /// A key, without running the event loop after it.
+    fn press(&self, text: impl Into<SharedString>) {
         let text = text.into();
         self.window.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
         self.window.dispatch_event(WindowEvent::KeyReleased { text });
-        self.settle();
+    }
+
+    /// Runs the event loop for a while: long enough for the window to see
+    /// that the list stopped moving.
+    fn wait(&self) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(200) {
+            self.settle();
+        }
     }
 
     fn ctrl(&self, text: &str) {
@@ -119,7 +139,7 @@ fn shots() {
     let original = std::fs::read_to_string(&sample).unwrap();
     editor.borrow_mut().load(sample);
     app.show().unwrap();
-    let h = Harness { window, dir };
+    let h = Harness { window, app: app.as_weak(), dir };
 
     h.snap("01-rendered");
 
@@ -164,10 +184,9 @@ fn shots() {
     h.key(SharedString::from(Key::Escape));
     h.snap("08-list-rendered");
     // Mouse wheel over a block scrolls the document.
-    h.window.dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(300.0, 400.0), delta_x: 0.0, delta_y: -400.0 });
+    h.scroll(-400.0);
     h.snap("09-scrolled");
-    h.window.dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(300.0, 400.0), delta_x: 0.0, delta_y: 400.0 });
-    h.settle();
+    h.scroll(400.0);
     let list_src = editor.borrow().doc.blocks[4].src.clone();
     println!("list src = {list_src:?}");
     assert!(list_src.contains("  - with nesting\n  - typed item"));
@@ -203,7 +222,7 @@ fn shots_typing() {
     wire(&app, &editor);
     editor.borrow_mut().start_blank();
     app.show().unwrap();
-    let h = Harness { window, dir };
+    let h = Harness { window, app: app.as_weak(), dir };
     h.snap("10-blank");
 
     h.type_text("# My notes");
@@ -280,7 +299,7 @@ fn perf_large_document() {
     let t = Instant::now();
     editor.borrow_mut().load(path);
     app.show().unwrap();
-    let h = Harness { window, dir: std::env::temp_dir() };
+    let h = Harness { window, app: app.as_weak(), dir: std::env::temp_dir() };
     h.settle();
     println!("{} blocks, {} KB: load + first frame {:?}", editor.borrow().doc.blocks.len(), big.len() / 1024, t.elapsed());
     h.click(232.0, 237.0);
@@ -308,7 +327,7 @@ fn shots_review() {
     let editor = Rc::new(RefCell::new(Editor::new(&app)));
     wire(&app, &editor);
     app.show().unwrap();
-    let h = Harness { window, dir: dir.clone() };
+    let h = Harness { window, app: app.as_weak(), dir: dir.clone() };
     let open = |name: &str, text: &str| {
         let file = dir.join(name);
         std::fs::write(&file, text).unwrap();
@@ -395,7 +414,7 @@ fn shots_large_document() {
     let editor = Rc::new(RefCell::new(Editor::new(&app)));
     wire(&app, &editor);
     app.show().unwrap();
-    let h = Harness { window, dir: dir.clone() };
+    let h = Harness { window, app: app.as_weak(), dir: dir.clone() };
     let src = |i: usize| editor.borrow().doc.blocks[i].src.clone();
     let editing = || editor.borrow().editing;
 
@@ -502,6 +521,204 @@ fn shots_large_document() {
     println!("large document checks passed");
 }
 
+/// Whether the badge of the block being edited ("text", "code", …) is on
+/// screen. It's drawn in the accent colour in the left margin, so it shows
+/// that the block has a row and that the row is in view.
+fn edit_badge_on_screen(h: &Harness) -> bool {
+    h.settle();
+    let mut buf = vec![Rgb8Pixel::default(); (W * H) as usize];
+    h.window.request_redraw();
+    h.window.draw_if_needed(|r| {
+        r.render(&mut buf, W as usize);
+    });
+    let (toolbar, status_bar) = (44, 26);
+    (toolbar..H as usize - status_bar).any(|y| {
+        buf[y * W as usize..][..130].iter().any(|p| (p.r, p.g, p.b) == (0x09, 0x69, 0xda))
+    })
+}
+
+/// In a document whose blocks differ in height, the list places the rows it
+/// creates by estimated heights, so a block's position changes as the list
+/// scrolls. Editing must not rely on where a block was: walking down with the
+/// arrow keys and typing after scrolling the block away both bring it into
+/// view, and no key is lost. No screenshots.
+#[test]
+#[ignore]
+fn shots_mixed_heights() {
+    let dir = std::env::temp_dir().join(format!("linter-mixed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    let app = App::new().unwrap();
+    window.set_size(PhysicalSize::new(W, H));
+    let editor = Rc::new(RefCell::new(Editor::new(&app)));
+    wire(&app, &editor);
+    app.show().unwrap();
+    let h = Harness { window, app: app.as_weak(), dir: dir.clone() };
+    let editing = || editor.borrow().editing;
+
+    // A paragraph and a 25-line code block, 100 times.
+    let mut text = String::new();
+    for i in 0..100 {
+        text.push_str(&format!("Paragraph {i}.\n\n```\n"));
+        for l in 0..25 {
+            text.push_str(&format!("code {i}.{l}\n"));
+        }
+        text.push_str("```\n\n");
+    }
+    let file = dir.join("mixed.md");
+    std::fs::write(&file, &text).unwrap();
+    let open = || {
+        editor.borrow_mut().load(file.clone());
+        h.settle();
+    };
+
+    // Down from the top: the block moved to is always on screen. This used to
+    // get stuck about 20 blocks down, with every key swallowed.
+    open();
+    editor.borrow_mut().request_edit(Some(0), Some(Cursor::End));
+    h.settle();
+    for n in 1..=320 {
+        h.key(Key::DownArrow);
+        if n % 10 == 0 {
+            assert!(edit_badge_on_screen(&h), "after {n} presses, editing {:?} is off screen", editing());
+        }
+    }
+    assert!(editing().is_some_and(|i| i >= 22), "the walk got stuck at {:?}", editing());
+    h.key(Key::Escape);
+
+    // Edit a block, scroll it far away (down, or up to the top), and type:
+    // the key goes in at its caret, the block comes back, and the next key
+    // goes in after it.
+    for (block, delta) in [(80, -40000.0), (160, 1_000_000.0)] {
+        open();
+        editor.borrow_mut().request_edit(Some(block), Some(Cursor::End));
+        h.settle();
+        assert!(edit_badge_on_screen(&h), "block {block} is brought into view to edit it");
+        h.scroll(delta);
+        assert!(!edit_badge_on_screen(&h), "block {block} scrolled away");
+        h.type_text("Z");
+        assert!(edit_badge_on_screen(&h), "typing brings block {block} back");
+        h.type_text("W");
+        let src = editor.borrow().doc.blocks[block].src.clone();
+        assert_eq!(src, format!("Paragraph {}.ZW", block / 2), "no key is lost");
+        h.key(Key::Escape);
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    println!("mixed heights checks passed");
+}
+
+/// Where the keys go while editing, around scrolling and the dialogs: the
+/// window holds the focus for the block being edited while the list may
+/// move, and no key may be lost or land somewhere else. No screenshots.
+#[test]
+#[ignore]
+fn shots_focus() {
+    let dir = std::env::temp_dir().join(format!("linter-focus-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    let app = App::new().unwrap();
+    window.set_size(PhysicalSize::new(W, H));
+    let editor = Rc::new(RefCell::new(Editor::new(&app)));
+    wire(&app, &editor);
+    app.show().unwrap();
+    let h = Harness { window, app: app.as_weak(), dir: dir.clone() };
+    let src = |i: usize| editor.borrow().doc.blocks[i].src.clone();
+    let open = |name: &str, text: &str| {
+        let file = dir.join(name);
+        std::fs::write(&file, text).unwrap();
+        editor.borrow_mut().load(file);
+        h.settle();
+    };
+    let edit = |i: usize| {
+        editor.borrow_mut().request_edit(Some(i), Some(Cursor::End));
+        h.settle();
+    };
+    let long: String = (0..400).map(|i| format!("Paragraph {i}.\n\n")).collect();
+
+    // A wheel turn that doesn't move the list (the document is shorter than
+    // the window): the text field takes the focus back, and handles the next
+    // key itself.
+    open("short.md", "one\n\ntwo\n");
+    edit(0);
+    h.scroll(-120.0);
+    h.wait();
+    h.press(Key::Backspace);
+    assert_eq!(src(0), "on", "Backspace went to the text field");
+    h.key(Key::Escape);
+
+    // The block scrolled partly out of view keeps no focus (taking it would
+    // scroll the list), but keys other than text aren't lost: they're played
+    // to its text field once it's back, in order.
+    let lines: String = (1..=25).map(|n| format!("Line {n} of a long paragraph\n")).collect();
+    let more: String = (0..30).map(|i| format!("\nMore {i}.\n")).collect();
+    open("partial.md", &format!("# Top\n\n{lines}end.\n{more}"));
+    edit(1);
+    h.scroll(-200.0);
+    h.wait();
+    h.press(Key::LeftArrow);
+    h.press("X");
+    h.wait();
+    assert!(src(1).ends_with("endX."), "{:?}", src(1));
+    h.key(Key::Backspace);
+    assert!(src(1).ends_with("end."), "{:?}", src(1));
+    h.key(Key::Escape);
+
+    // A scroll that didn't start with a wheel turn (the scroll bar, say) drops
+    // the row with the text field that has the focus. A key typed right after
+    // is typed in, not lost.
+    open("long.md", &long);
+    edit(10);
+    h.window.dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(300.0, 400.0), delta_x: 0.0, delta_y: -20000.0 });
+    h.settle();
+    h.press("Z");
+    h.wait();
+    assert_eq!(src(10), "Paragraph 10.Z");
+    h.key(Key::Escape);
+
+    // Closing the About dialog leaves the list where it is.
+    edit(10);
+    h.scroll(-20000.0);
+    assert!(!edit_badge_on_screen(&h));
+    h.click(1000.0, 22.0);
+    assert!(app.get_about_open(), "the About button opened the dialog");
+    h.key(Key::Escape);
+    assert!(!app.get_about_open());
+    h.wait();
+    assert!(!edit_badge_on_screen(&h), "closing About didn't scroll to the block being edited");
+    h.type_text("Y");
+    assert!(edit_badge_on_screen(&h), "typing did");
+    assert_eq!(src(10), "Paragraph 10.ZY");
+    h.key(Key::Escape);
+
+    // The unsaved changes dialog: it replaces the About dialog, nothing is
+    // typed behind it, even after a wheel turn, and Esc cancels it.
+    open("short.md", "one\n\ntwo\n");
+    edit(0);
+    h.type_text("A");
+    h.click(1000.0, 22.0);
+    assert!(app.get_about_open());
+    assert!(!editor.borrow_mut().guard(Pending::Close));
+    h.settle();
+    assert!(app.get_confirm_open());
+    assert!(!app.get_about_open(), "one dialog at a time");
+    h.scroll(-300.0);
+    h.wait();
+    h.type_text("Q");
+    assert_eq!(src(0), "oneA", "nothing is typed behind the dialog");
+    h.key(Key::Escape);
+    assert!(!app.get_confirm_open());
+    assert!(editor.borrow().pending.is_none());
+    h.wait();
+    h.type_text("R");
+    assert_eq!(src(0), "oneAR");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    println!("focus checks passed");
+}
+
 /// The theme menu, the dark theme, and leaving edit mode by clicking blank
 /// space. Writes screenshots to `SHOT_DIR`.
 #[test]
@@ -512,6 +729,7 @@ fn shots_theme() {
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
     slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
     let app = App::new().unwrap();
+    app.set_version(env!("CARGO_PKG_VERSION").into());
     if let Some(mono) = monospace_family() {
         app.global::<Theme>().set_mono(mono.into());
     }
@@ -524,10 +742,13 @@ fn shots_theme() {
     let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/sample.md");
     editor.borrow_mut().load(sample);
     app.show().unwrap();
-    let h = Harness { window, dir };
+    let h = Harness { window, app: app.as_weak(), dir };
     let dark = || app.global::<Theme>().get_dark();
-    let (menu_x, menu_y) = (W as f32 - 52.0, 22.0);
-    let (item_x, light_y, dark_y) = (W as f32 - 100.0, 59.0, 89.0);
+    // The About button is at the right end of the toolbar, the Theme menu
+    // left of it.
+    let (about_x, about_y) = (W as f32 - 43.0, 22.0);
+    let (menu_x, menu_y) = (W as f32 - 115.0, 22.0);
+    let (item_x, light_y, dark_y) = (W as f32 - 162.0, 59.0, 89.0);
 
     h.snap("t1-light");
     h.click(menu_x, menu_y);
@@ -549,16 +770,14 @@ fn shots_theme() {
     // Below the document: the first click leaves edit mode, the next one
     // continues writing at the end.
     h.click(232.0, 237.0);
-    h.window.dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(300.0, 400.0), delta_x: 0.0, delta_y: -100000.0 });
-    h.settle();
+    h.scroll(-100000.0);
     h.click(500.0, H as f32 - 60.0);
     assert_eq!(editor.borrow().editing, None, "a click below the document leaves edit mode");
     h.snap("t6-dark-bottom");
     h.click(500.0, H as f32 - 60.0);
     assert!(editor.borrow().editing.is_some(), "a second click below continues writing at the end");
     h.key(SharedString::from(Key::Escape));
-    h.window.dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(300.0, 400.0), delta_x: 0.0, delta_y: 100000.0 });
-    h.settle();
+    h.scroll(100000.0);
 
     h.click(menu_x, menu_y);
     h.snap("t7-menu-dark");
@@ -575,4 +794,133 @@ fn shots_theme() {
     h.window.dispatch_event(WindowEvent::CloseRequested);
     h.snap("t8-dark-dialog");
     editor.borrow_mut().confirm(2);
+
+    // The About dialog, opened while a block is being edited: keys don't
+    // reach the block, and closing it gives the block the focus back.
+    let before = editor.borrow().doc.blocks[1].src.clone();
+    h.click(about_x, about_y);
+    assert!(app.get_about_open(), "the About button opens the dialog");
+    h.snap("t9-about-dark");
+    h.type_text("x");
+    assert_eq!(editor.borrow().doc.blocks[1].src, before, "keys don't reach the block behind the dialog");
+    h.key(SharedString::from(Key::Escape));
+    assert!(!app.get_about_open(), "Esc closes the dialog");
+    assert_eq!(editor.borrow().editing, Some(1), "closing the dialog doesn't stop editing");
+    h.type_text("?");
+    assert_eq!(editor.borrow().doc.blocks[1].src, format!("{before}?"), "the block gets the keys again");
+
+    h.click(menu_x, menu_y);
+    h.click(item_x, light_y);
+    assert!(!dark());
+    h.click(about_x, about_y);
+    h.snap("t10-about-light");
+    h.click(30.0, 400.0);
+    assert!(!app.get_about_open(), "a click beside the dialog closes it");
+}
+
+/// Images in each format, from files and over HTTP, with the placeholder
+/// while one loads and the reasons when one can't be shown.
+#[test]
+#[ignore]
+fn shots_images() {
+    use crate::images::tests::{encode, gradient, webp_bytes};
+    use image::{DynamicImage, ImageFormat};
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    let dir = PathBuf::from(std::env::var("SHOT_DIR").unwrap_or_else(|_| "target/shots".into()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let docs = std::env::temp_dir().join(format!("linter-shots-images-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&docs);
+    std::fs::create_dir_all(&docs).unwrap();
+    let rgb = DynamicImage::ImageRgb8(gradient(320, 60));
+    let rgba = DynamicImage::ImageRgba8(rgb.to_rgba8());
+    for (name, image, format) in [("a.png", &rgba, ImageFormat::Png), ("b.jpg", &rgb, ImageFormat::Jpeg), ("c.gif", &rgba, ImageFormat::Gif), ("d.bmp", &rgb, ImageFormat::Bmp)] {
+        std::fs::write(docs.join(name), encode(image, format)).unwrap();
+    }
+    std::fs::write(docs.join("e.webp"), webp_bytes(320, 60, true)).unwrap();
+    std::fs::write(docs.join("f.svg"), r##"<svg xmlns="http://www.w3.org/2000/svg" width="320" height="60"><rect width="320" height="60" rx="8" fill="#e8a33d"/></svg>"##).unwrap();
+    // A big photo is scaled down while it's decoded.
+    std::fs::write(docs.join("g.jpg"), encode(&DynamicImage::ImageRgb8(gradient(4000, 1000)), ImageFormat::Jpeg)).unwrap();
+
+    // A server that answers the first request after a pause, so the
+    // placeholder shows, and the second with a 404.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    let png = encode(&DynamicImage::ImageRgb8(gradient(320, 60)), ImageFormat::Png);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate = release.clone();
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let (gate, png) = (gate.clone(), png.clone());
+            // Each on its own thread: the paused one mustn't hold up the other.
+            std::thread::spawn(move || {
+                let mut request = [0u8; 4096];
+                let n = stream.read(&mut request).unwrap_or(0);
+                if request[..n].starts_with(b"GET /remote.png") {
+                    let (lock, cvar) = &*gate;
+                    let _go = cvar.wait_while(lock.lock().unwrap(), |go| !*go).unwrap();
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", png.len());
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&png);
+                } else {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+            });
+        }
+    });
+
+    let md = format!(
+        "# Images\n\n![png](a.png)\n\n![jpeg](b.jpg)\n\n![gif](c.gif)\n\n![bmp](d.bmp)\n\n![webp](e.webp)\n\n![svg](f.svg)\n\n\
+         ![remote]({server}/remote.png)\n\n![gone]({server}/gone.png)\n\n![missing](nope.png)\n\n![photo](g.jpg)\n"
+    );
+    let file = docs.join("images.md");
+    std::fs::write(&file, md).unwrap();
+
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    let app = App::new().unwrap();
+    window.set_size(PhysicalSize::new(W, H));
+    let editor = Rc::new(RefCell::new(Editor::new(&app)));
+    wire(&app, &editor);
+    editor.borrow_mut().load(file);
+    app.show().unwrap();
+    let h = Harness { window, app: app.as_weak(), dir };
+
+    let row = |i: usize| editor.borrow().model.row_data(i).unwrap();
+    let wait = |done: &dyn Fn() -> bool| {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(10), "images didn't load");
+            h.settle();
+        }
+    };
+    // Blocks: 0 heading, then the images in order.
+    wait(&|| (1..=6).all(|i| row(i).has_image) && !row(8).caption.contains("loading"));
+    assert!(row(7).caption.ends_with("— loading…"), "{}", row(7).caption);
+    h.snap("i1-loading");
+
+    let (lock, cvar) = &*release;
+    *lock.lock().unwrap() = true;
+    cvar.notify_all();
+    wait(&|| row(7).has_image && row(10).has_image);
+    assert!(row(8).caption.ends_with("/gone.png: the server answered 404 Not Found"), "{}", row(8).caption);
+    assert!(row(9).caption.ends_with("nope.png: file not found"), "{}", row(9).caption);
+    let photo = row(10).image.size();
+    assert_eq!((photo.width, photo.height), (1640, 410), "the photo is scaled to the column at 2x");
+    h.snap("i2-loaded");
+    h.scroll(-100000.0);
+    h.snap("i3-bottom");
+
+    // On a screen at 3x, the photo is decoded again for the wider column,
+    // and the old one is shown meanwhile.
+    h.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: 3.0 });
+    // The same pixels, for the frame buffer.
+    h.window.set_size(PhysicalSize::new(W, H));
+    editor.borrow().rescaled();
+    assert!(row(10).has_image);
+    wait(&|| row(10).image.size().width == 2460);
+    assert_eq!(row(10).image.size().height, 615);
+    let _ = std::fs::remove_dir_all(&docs);
 }
