@@ -1,8 +1,41 @@
 # linter
 
-A small Typora-style Markdown editor written in Rust with [Slint](https://slint.dev).
+A small Typora-style Markdown editor for the desktop, written in Rust with
+[Slint](https://slint.dev).
 
-The document is shown rendered. Click a block, such as a heading, paragraph, list, quote,
+There's no separate preview pane: you read and edit the document rendered. Click a block
+and it turns into its Markdown source right where it was. Click elsewhere and it renders
+again.
+
+## Features
+
+- **Edit in place:** headings, lists, quotes, code blocks, tables and images are shown
+  rendered. Only the block you're editing shows its Markdown.
+- **Careful with your files:** a file you open and save without edits is written back
+  byte for byte. Line endings and the byte order mark are kept, and a failed save never
+  leaves a truncated file.
+- **Images** from files and the web, in all the common formats, loaded in the background.
+- **Long documents:** only the blocks in view are built, so memory use doesn't grow with
+  the length of the file.
+- **Keyboard shortcuts** for headings, bold and italic, list indent, and moving between
+  blocks.
+- **Light and dark themes**, and a Windows installer.
+
+## Quick start
+
+You need [Rust](https://rustup.rs), a C compiler (for libwebp) and, on Linux, the OpenSSL
+headers (`openssl-devel` on Fedora, `libssl-dev` on Debian and Ubuntu).
+
+```sh
+git clone https://github.com/mpetrel/linter.git
+cd linter
+cargo run --release -- examples/sample.md  # a tour of what's supported
+cargo run --release -- path/to/file.md     # or start without a file
+```
+
+## How editing works
+
+Click a block, such as a heading, paragraph, list, quote,
 code fence or table, and it turns into its raw Markdown in place, styled like the block.
 Edit it, then click elsewhere or press `Esc`, and it renders again. For example, click a
 rendered `## Heading`, add a `#`, and it becomes `### Heading` as you type.
@@ -15,14 +48,6 @@ The *Theme* menu at the right of the toolbar switches between the light and dark
 The choice is remembered in `~/.config/linter/settings` (`%APPDATA%\linter\settings` on
 Windows, `~/Library/Application Support/linter/settings` on macOS). *About* shows the
 version and the Slint attribution.
-
-```sh
-cargo run --release -- path/to/file.md     # or start without a file
-cargo run --release -- examples/sample.md  # a tour of what's supported
-```
-
-Building needs a C compiler (for libwebp) and, on Linux, the OpenSSL headers
-(`openssl-devel` on Fedora, `libssl-dev` on Debian and Ubuntu).
 
 ## Files
 
