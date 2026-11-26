@@ -84,6 +84,8 @@ export global Theme {
     out property <color> quote-bar: dark ? #3d444d : #d1d9e0;
     out property <color> row-alt: dark ? #10151c : #fafbfc;
     out property <color> selection: dark ? #264f78 : #b6d7ff;
+    // Over blocks selected as a whole, so that it tints code and tables too.
+    out property <color> block-selection: dark ? #4493f83d : #0969da26;
     // Neutral fill on the page: block type badge, hovered dialog button.
     out property <color> subtle: dark ? #262c36 : #eef1f4;
     out property <color> hover: dark ? #262c36 : #e8ecf0;
@@ -296,6 +298,11 @@ component BlockView {
     in property <Ask> ask;
     // Whether taking the focus now would leave the list where it is.
     in property <bool> resumable;
+    // Selected as a whole, with the blocks next to it from `sel-top` to
+    // `sel-bottom` (see App.sel-first).
+    in property <bool> selected;
+    in property <bool> sel-top;
+    in property <bool> sel-bottom;
     out property <length> input-top: input.y;
     out property <length> input-height: input.height;
 
@@ -327,6 +334,9 @@ component BlockView {
     // caret moves aren't reported.
     property <int> started-seq: -1;
     property <bool> scroll-to-caret: true;
+    // Ctrl+V was pressed: the text field's next edit is the paste, which may
+    // hold several blocks.
+    property <bool> pasting;
 
     height: root.editing ? max(input.preferred-height, root.line-h) + root.pad-top + root.pad-bottom : view.preferred-height;
 
@@ -395,6 +405,9 @@ component BlockView {
         if input.text != root.data.source {
             input.text = root.data.source;
         }
+        // A drag that selects blocks may have started in this text (see
+        // cursor-position-changed).
+        input.clear-selection();
     }
 
     function report-caret() {
@@ -549,16 +562,34 @@ component BlockView {
             // so a click lands on the same line in the raw text.
             line-height-factor: data.kind == BlockKind.list || data.kind == BlockKind.quote ? (root.line-h + 6px) / root.line-h : 1;
             color: !root.editing ? transparent : data.kind == BlockKind.heading && data.level == 6 ? Theme.soft : Theme.ink;
-            selection-background-color: Theme.selection;
+            // Never over the rendered block (see cursor-position-changed).
+            selection-background-color: root.editing ? Theme.selection : transparent;
             selection-foreground-color: Theme.ink;
 
             edited => {
+                // The hidden text of a block that isn't being edited: a
+                // middle click pasted into it, say, before the editor moved
+                // editing to it, or while it took the focus back after a drag.
+                if !root.editing {
+                    self.text = root.data.source;
+                    return;
+                }
                 root.edited(root.index, self.text);
+                if root.pasting {
+                    root.pasting = false;
+                    root.act("pasted");
+                }
             }
             cursor-position-changed(pos) => {
                 root.caret-y = pos.y;
                 if root.editing && root.started-seq == root.edit-seq {
                     root.report-caret();
+                } else if !root.editing && root.selected && self.anchor-position-byte-offset != self.cursor-position-byte-offset {
+                    // A drag from this text selected blocks, and the text field
+                    // still follows the pointer: it would put the text it
+                    // selects on the X11/Wayland primary selection when the
+                    // button is let go.
+                    self.clear-selection();
                 }
             }
             changed has-focus => {
@@ -575,6 +606,7 @@ component BlockView {
                 }
             }
             key-pressed(e) => {
+                root.pasting = false;
                 if e.text == Key.Escape {
                     return root.act("escape");
                 }
@@ -602,7 +634,37 @@ component BlockView {
                 if e.text == Key.DownArrow && !e.modifiers.shift && root.caret-y + root.line-h * 1.5 > self.height {
                     return root.act("down");
                 }
+                // Shift+Up at the start, Shift+Down at the end: select blocks.
+                if e.text == Key.UpArrow && e.modifiers.shift && root.caret-y < root.line-h * 0.5 {
+                    return root.act("select-up");
+                }
+                if e.text == Key.DownArrow && e.modifiers.shift && root.caret-y + root.line-h * 1.5 > self.height {
+                    return root.act("select-down");
+                }
                 if e.modifiers.control && !e.modifiers.alt {
+                    // Once all of the block is selected, the whole document.
+                    if (e.text == "a" || e.text == "A") && !e.modifiers.shift {
+                        return root.act("select-all");
+                    }
+                    if (e.text == "c" || e.text == "C") && e.modifiers.shift {
+                        return root.act("copy-plain");
+                    }
+                    // The text field pastes, and `edited` splits up the blocks
+                    // it pasted.
+                    if (e.text == "v" || e.text == "V") && !e.modifiers.shift {
+                        root.pasting = true;
+                        return root.act("paste");
+                    }
+                    // The text field undoes its own edits first. Once it has
+                    // none left, blocks deleted or pasted as a whole come back.
+                    if (e.text == "z" || e.text == "Z") && !e.modifiers.shift {
+                        let before = self.text;
+                        self.undo();
+                        if self.text != before {
+                            return EventResult.accept;
+                        }
+                        return root.act("undo");
+                    }
                     if e.text == "=" || e.text == "+" {
                         return root.act("promote");
                     }
@@ -630,6 +692,18 @@ component BlockView {
             color: Theme.muted;
             font-size: Theme.body;
         }
+    }
+
+    // Selected as a whole: over the block, and into the margins like the
+    // edit highlight. Selected blocks next to each other make one band.
+    if root.selected: Rectangle {
+        x: -14px;
+        width: parent.width + 28px;
+        background: Theme.block-selection;
+        border-top-left-radius: root.sel-top ? 6px : 0px;
+        border-top-right-radius: root.sel-top ? 6px : 0px;
+        border-bottom-left-radius: root.sel-bottom ? 6px : 0px;
+        border-bottom-right-radius: root.sel-bottom ? 6px : 0px;
     }
 
     // Block type badge in the left margin.
@@ -671,6 +745,13 @@ component BlockRow {
     // The part of the list in view, in list content coordinates.
     in property <length> view-top;
     in property <length> view-height;
+    in property <bool> selected;
+    in property <bool> sel-top;
+    in property <bool> sel-bottom;
+    // While the mouse button is held after a press on the document: where
+    // the pointer is, in list content coordinates (see App.drag-y).
+    in property <bool> drag-armed;
+    in property <length> drag-y;
 
     callback request-edit(index: int, cursor: int);
     callback edited(index: int, text: string);
@@ -688,6 +769,25 @@ component BlockRow {
     // asks again whenever its data is set, which Rust does to have the rows
     // in view load their image again.
     callback show-image(index: int);
+    // The pointer of a drag is over this row: with every move, and as the
+    // list scrolls under it. Rust ignores the repeats.
+    callback drag-over(index: int);
+
+    property <bool> drag-here: root.drag-armed && root.drag-y >= root.y && root.drag-y < root.y + root.height;
+    changed drag-here => {
+        root.report-drag();
+    }
+    changed drag-y => {
+        root.report-drag();
+    }
+    changed index => {
+        root.report-drag();
+    }
+    function report-drag() {
+        if root.drag-here {
+            root.drag-over(root.index);
+        }
+    }
 
     init => {
         root.check-image();
@@ -737,6 +837,9 @@ component BlockRow {
         ask-seq: root.ask-seq;
         ask: root.ask;
         resumable: root.resumable;
+        selected: root.selected;
+        sel-top: root.sel-top;
+        sel-bottom: root.sel-bottom;
         request-edit(index, cursor) => {
             root.request-edit(index, cursor);
         }
@@ -978,6 +1081,11 @@ export component App inherits Window {
     in property <int> focus-rule: -1;
     in property <string> settings-error;
     in property <string> settings-path;
+    // The blocks selected as a whole, first to last, or -1: dragged across,
+    // Ctrl+A twice, Shift+click. No block is edited meanwhile, and the window
+    // has the focus, for the keys that act on them (doc-key).
+    in property <int> sel-first: -1;
+    in property <int> sel-last: -1;
 
     callback edited(index: int, text: string);
     callback key-action(index: int, command: string, text: string, cursor: int, anchor: int) -> EditResult;
@@ -1006,6 +1114,13 @@ export component App inherits Window {
     callback edit-focused();
     // The list shows the row of image block `index`.
     callback show-image(index: int);
+    // A mouse button went down; `drag`: the left one on the document, and
+    // while it's held, the pointer is over block `index` (see drag-y).
+    callback button-pressed(drag: bool);
+    callback drag-over(index: int);
+    // A key while no block is being edited: Ctrl+A, and the keys for the
+    // blocks selected. Returns whether it was used.
+    callback doc-key(text: string, modifiers: Modifiers) -> bool;
 
     // The caret of edit session `caret-seq`, saved as the block being edited
     // reports it, so that it can be put back when that block is created again
@@ -1045,10 +1160,66 @@ export component App inherits Window {
     property <length> domain-width: 200px;
     // A dialog keeps the focus while it's open.
     property <bool> modal-open: root.about-open || root.confirm-open || root.settings-open;
+    // The mouse button is held after a press on the document. A text field
+    // that the press went to takes the pointer events, but `page`, around the
+    // list, still sees where the pointer is: `drag-y`, in list content
+    // coordinates, within the part in view. The rows tell Rust when it's
+    // over them, and Rust selects the blocks from the one the drag started on.
+    property <bool> drag-armed;
+    property <length> drag-y: root.drag-armed ? clamp(page.mouse-y, 0px, max(0px, sv.visible-height - 1px)) - sv.content-y : 0px;
+    property <int> sel-count: root.sel-first >= 0 ? root.sel-last - root.sel-first + 1 : 0;
 
     // A new document starts at its top.
     public function scroll-to-top() {
         sv.content-y = 0;
+    }
+
+    // A mouse button goes down, or the left one up, as the platform reports
+    // it before the window handles it (Rust calls these from the winit event
+    // hook). A left press on the document, but not on its scroll bar (which
+    // the Fluent style lays over the right edge of the list once it's longer
+    // than the view), may drag a selection across blocks.
+    public function pointer-pressed(left: bool) {
+        let on-scroll-bar = sv.content-height > sv.visible-height && page.mouse-x >= sv.visible-width - 16px;
+        root.drag-armed = left && page.has-hover && !on-scroll-bar && !root.modal-open;
+        root.button-pressed(root.drag-armed);
+    }
+
+    public function pointer-released() {
+        root.drag-armed = false;
+    }
+
+    // Slint has no clipboard for Rust, but its text fields use the system's:
+    // `clip`, never shown, carries text there and back.
+    public function copy-text(text: string) {
+        clip.text = text;
+        clip.select-all();
+        clip.copy();
+        clip.text = "";
+    }
+
+    public function clipboard-text() -> string {
+        clip.text = "";
+        clip.paste();
+        let text = clip.text;
+        clip.text = "";
+        return text;
+    }
+
+    // Scrolls block `index` into view: the end of the selection moved there.
+    public function show-row(index: int) {
+        sv.ensure-row-visible(index, ScrollBehavior.instant);
+    }
+
+    // Dragging above or below the list scrolls it, faster the further out.
+    drag-scroll := Timer {
+        interval: 30ms;
+        running: root.drag-armed && (page.mouse-y < 0px || page.mouse-y > sv.visible-height);
+        triggered => {
+            let over = page.mouse-y < 0px ? page.mouse-y : page.mouse-y - sv.visible-height;
+            let max-scroll = max(0px, sv.content-height - sv.visible-height);
+            sv.content-y = -clamp(-sv.content-y + clamp(over / 2, -60px, 60px), 0px, max-scroll);
+        }
     }
 
     // Scrolls the caret of the block being edited into view, bringing the block
@@ -1222,7 +1393,7 @@ export component App inherits Window {
 
     property <BlockKind> editing-kind: root.editing-index >= 0 ? root.blocks[root.editing-index].kind : BlockKind.empty;
     property <int> editing-level: root.editing-index >= 0 ? root.blocks[root.editing-index].level : 0;
-    property <string> hint: root.editing-index < 0 ? "Click a block to edit its Markdown" : root.editing-kind == BlockKind.heading ? "Heading \{root.editing-level}  ·  edit the #'s, or Ctrl+= / Ctrl+- to change level  ·  Ctrl+0 paragraph  ·  Esc done" : root.editing-kind == BlockKind.list ? "List  ·  Enter next item  ·  Tab / Shift+Tab indent  ·  Enter on empty item ends the list" : root.editing-kind == BlockKind.quote ? "Quote  ·  Enter continues  ·  Enter on an empty line ends the quote" : root.editing-kind == BlockKind.code ? "Code  ·  Enter new line  ·  Tab / Shift+Tab indent  ·  Ctrl+Enter or ↓ at the end leaves the block" : root.editing-kind == BlockKind.table ? "Table  ·  edit the rows as text  ·  Ctrl+Enter adds a paragraph below" : "Text  ·  Ctrl+1…6 heading  ·  Ctrl+B / Ctrl+I  ·  Shift+Enter line break  ·  Esc done";
+    property <string> hint: root.sel-count > 0 ? (root.sel-count == 1 ? "1 block" : "\{root.sel-count} blocks") + " selected  ·  Ctrl+C copy  ·  Ctrl+Shift+C copy as plain text  ·  Ctrl+X cut  ·  Delete removes  ·  Shift+Up / Down extends  ·  Esc" : root.editing-index < 0 ? "Click a block to edit its Markdown, or drag across blocks to select them" : root.editing-kind == BlockKind.heading ? "Heading \{root.editing-level}  ·  edit the #'s, or Ctrl+= / Ctrl+- to change level  ·  Ctrl+0 paragraph  ·  Esc done" : root.editing-kind == BlockKind.list ? "List  ·  Enter next item  ·  Tab / Shift+Tab indent  ·  Enter on empty item ends the list" : root.editing-kind == BlockKind.quote ? "Quote  ·  Enter continues  ·  Enter on an empty line ends the quote" : root.editing-kind == BlockKind.code ? "Code  ·  Enter new line  ·  Tab / Shift+Tab indent  ·  Ctrl+Enter or ↓ at the end leaves the block" : root.editing-kind == BlockKind.table ? "Table  ·  edit the rows as text  ·  Ctrl+Enter adds a paragraph below" : "Text  ·  Ctrl+1…6 heading  ·  Ctrl+B / Ctrl+I  ·  Shift+Enter line break  ·  Esc done";
 
     // `y` is in list content coordinates.
     function scroll-into-view(y: length, h: length) {
@@ -1296,8 +1467,11 @@ export component App inherits Window {
         // Only reached with nothing else focused: the window holds the focus
         // for the block being edited (see park-focus), or nothing is edited.
         key-pressed(e) => {
-            if !self.has-focus || root.editing-index < 0 || root.modal-open {
+            if !self.has-focus || root.modal-open {
                 return EventResult.reject;
+            }
+            if root.editing-index < 0 {
+                return root.doc-key(e.text, root.modifiers-of(e.modifiers)) ? EventResult.accept : EventResult.reject;
             }
             if e.text == Key.Escape {
                 root.finish-edit();
@@ -1376,98 +1550,108 @@ export component App inherits Window {
             Rectangle {
                 vertical-stretch: 1;
 
-                // The page below a document shorter than the window.
-                TouchArea {
+                // The page below a document shorter than the window. The list
+                // is inside it, so that it sees where the pointer is even while
+                // a text field in the list takes the pointer events (drag-y).
+                page := TouchArea {
                     mouse-cursor: MouseCursor.text;
                     clicked => {
                         root.click-below();
                     }
-                }
 
-                sv := ListView {
-                    width: parent.width;
-                    height: parent.height;
-                    mouse-drag-pan-enabled: false;
-                    changed content-y => {
-                        root.list-scrolled();
-                        root.list-moved();
-                    }
+                    sv := ListView {
+                        width: parent.width;
+                        height: parent.height;
+                        mouse-drag-pan-enabled: false;
+                        changed content-y => {
+                            root.list-scrolled();
+                            root.list-moved();
+                        }
 
-                    for block[i] in root.blocks: BlockRow {
-                        data: block;
-                        index: i;
-                        first: i == 0;
-                        last: i == root.blocks.length - 1;
-                        column-x: root.column-x;
-                        column-width: root.column-width;
-                        editing: i == root.editing-index;
-                        edit-seq: root.edit-seq;
-                        cursor-request: root.cursor-request;
-                        placeholder: root.doc-blank && root.blocks.length == 1;
-                        caret-seq: root.caret-seq;
-                        saved-caret: root.saved-caret;
-                        saved-anchor: root.saved-anchor;
-                        ask-seq: root.ask-seq;
-                        ask: root.sent-ask;
-                        view-top: -sv.content-y;
-                        view-height: sv.visible-height;
-                        request-edit(index, cursor) => {
-                            root.request-edit(index, cursor);
-                        }
-                        edited(index, text) => {
-                            root.edited(index, text);
-                        }
-                        key-action(index, command, text, cursor, anchor) => {
-                            return root.key-action(index, command, text, cursor, anchor);
-                        }
-                        release-focus => {
-                            fs.focus();
-                        }
-                        caret-moved(index, caret, anchor, caret-y, line-h, scroll) => {
-                            if index != root.editing-index {
-                                return;
+                        for block[i] in root.blocks: BlockRow {
+                            data: block;
+                            index: i;
+                            first: i == 0;
+                            last: i == root.blocks.length - 1;
+                            column-x: root.column-x;
+                            column-width: root.column-width;
+                            editing: i == root.editing-index;
+                            edit-seq: root.edit-seq;
+                            cursor-request: root.cursor-request;
+                            placeholder: root.doc-blank && root.blocks.length == 1;
+                            caret-seq: root.caret-seq;
+                            saved-caret: root.saved-caret;
+                            saved-anchor: root.saved-anchor;
+                            ask-seq: root.ask-seq;
+                            ask: root.sent-ask;
+                            view-top: -sv.content-y;
+                            view-height: sv.visible-height;
+                            selected: i >= root.sel-first && i <= root.sel-last;
+                            sel-top: i == root.sel-first;
+                            sel-bottom: i == root.sel-last;
+                            drag-armed: root.drag-armed;
+                            drag-y: root.drag-y;
+                            request-edit(index, cursor) => {
+                                root.request-edit(index, cursor);
                             }
-                            root.caret-seq = root.edit-seq;
-                            root.saved-caret = caret;
-                            root.saved-anchor = anchor;
-                            if scroll {
-                                root.scroll-into-view(caret-y, line-h);
+                            edited(index, text) => {
+                                root.edited(index, text);
                             }
-                        }
-                        answered(index) => {
-                            if index == root.editing-index {
-                                root.answered = true;
-                                if root.sent-ask == Ask.reveal {
-                                    root.want-reveal = false;
+                            key-action(index, command, text, cursor, anchor) => {
+                                return root.key-action(index, command, text, cursor, anchor);
+                            }
+                            release-focus => {
+                                fs.focus();
+                            }
+                            caret-moved(index, caret, anchor, caret-y, line-h, scroll) => {
+                                if index != root.editing-index {
+                                    return;
+                                }
+                                root.caret-seq = root.edit-seq;
+                                root.saved-caret = caret;
+                                root.saved-anchor = anchor;
+                                if scroll {
+                                    root.scroll-into-view(caret-y, line-h);
                                 }
                             }
-                        }
-                        created(index) => {
-                            if index != root.editing-index {
-                                return;
+                            answered(index) => {
+                                if index == root.editing-index {
+                                    root.answered = true;
+                                    if root.sent-ask == Ask.reveal {
+                                        root.want-reveal = false;
+                                    }
+                                }
                             }
-                            // Asked before it existed, the row couldn't answer:
-                            // ask again.
-                            if root.want-reveal || (root.check-pending && root.sent-ask == Ask.reveal) {
-                                root.want-reveal = false;
-                                root.ask(Ask.reveal);
-                            } else if root.check-pending {
-                                root.ask(root.sent-ask);
+                            created(index) => {
+                                if index != root.editing-index {
+                                    return;
+                                }
+                                // Asked before it existed, the row couldn't answer:
+                                // ask again.
+                                if root.want-reveal || (root.check-pending && root.sent-ask == Ask.reveal) {
+                                    root.want-reveal = false;
+                                    root.ask(Ask.reveal);
+                                } else if root.check-pending {
+                                    root.ask(root.sent-ask);
+                                }
                             }
-                        }
-                        focused(index) => {
-                            if index == root.editing-index {
-                                root.edit-focused();
+                            focused(index) => {
+                                if index == root.editing-index {
+                                    root.edit-focused();
+                                }
                             }
-                        }
-                        click-blank => {
-                            root.click-blank();
-                        }
-                        click-below => {
-                            root.click-below();
-                        }
-                        show-image(index) => {
-                            root.show-image(index);
+                            click-blank => {
+                                root.click-blank();
+                            }
+                            click-below => {
+                                root.click-below();
+                            }
+                            show-image(index) => {
+                                root.show-image(index);
+                            }
+                            drag-over(index) => {
+                                root.drag-over(index);
+                            }
                         }
                     }
                 }
@@ -1752,6 +1936,14 @@ export component App inherits Window {
                     }
                 }
             }
+        }
+
+        // The clipboard's go-between (see copy-text). Disabled, it never takes
+        // the focus; its functions work all the same.
+        clip := TextInput {
+            visible: false;
+            enabled: false;
+            single-line: false;
         }
 
         // Last, so that it shows above the other dialogs.

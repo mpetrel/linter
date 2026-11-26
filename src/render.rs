@@ -7,6 +7,7 @@
 
 use crate::doc::{self, Kind, LinkRefs, parser};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Tag, TagEnd};
+use std::ops::Range;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Line {
@@ -104,6 +105,188 @@ pub fn render(src: &str, refs: &LinkRefs) -> Rendered {
         Kind::Rule | Kind::Empty => {}
     }
     out
+}
+
+/// The text of a block as it reads rendered, without its Markdown: what
+/// Ctrl+Shift+C copies. Lines are separated by line breaks and table cells by
+/// tabs; list items keep their bullet or number, and tasks their box (☐ ☑).
+/// Images give their alt text, rules and link reference definitions nothing.
+///
+/// With `range` (byte offsets into `src`, on character boundaries), only the
+/// text from that part of the source, and a list item's bullet only if the
+/// range takes in the start of the item.
+pub fn plain_text(src: &str, refs: &LinkRefs, range: Option<Range<usize>>) -> String {
+    let mut plain = Plain {
+        src,
+        range: range.map(|r| r.start.min(src.len())..r.end.min(src.len())),
+        out: String::new(),
+        newline: false,
+        started: false,
+        tabs: 0,
+        prefix: None,
+        lists: Vec::new(),
+        cell: 0,
+    };
+    for (event, at) in parser(src, refs).into_offset_iter() {
+        plain.event(event, at);
+    }
+    plain.out
+}
+
+/// Collects the plain text of a block for `plain_text`. Separators and
+/// bullets wait for the text after them, so that none is left over at either
+/// end of a range.
+struct Plain<'s> {
+    src: &'s str,
+    range: Option<Range<usize>>,
+    out: String,
+    /// A line break is due before the next text.
+    newline: bool,
+    /// Something was written, or an empty table cell passed: a line break
+    /// due is written before what comes next.
+    started: bool,
+    /// Tabs due before the next text: the table cells passed in its row.
+    tabs: usize,
+    /// The bullet or number of the item whose text comes next.
+    prefix: Option<String>,
+    /// The next number of each list the text is in (`None`: bullets).
+    lists: Vec<Option<u64>>,
+    /// The cell of the table row the text is in.
+    cell: usize,
+}
+
+impl Plain<'_> {
+    fn covers(&self, at: usize) -> bool {
+        self.range.as_ref().is_none_or(|r| r.contains(&at))
+    }
+
+    fn event(&mut self, event: Event<'_>, at: Range<usize>) {
+        match event {
+            Event::Start(Tag::List(start)) => {
+                self.newline = true;
+                self.lists.push(start);
+            }
+            Event::End(TagEnd::List(_)) => {
+                self.lists.pop();
+            }
+            Event::Start(Tag::Item) => {
+                self.newline = true;
+                let depth = self.lists.len().saturating_sub(1);
+                let marker = match self.lists.last_mut() {
+                    Some(Some(n)) => {
+                        *n += 1;
+                        format!("{}.", *n - 1)
+                    }
+                    _ => ["•", "◦", "▪"][depth % 3].to_owned(),
+                };
+                self.prefix = self.covers(at.start).then(|| format!("{}{marker} ", "  ".repeat(depth)));
+            }
+            Event::TaskListMarker(done) => {
+                if let Some(prefix) = self.prefix.as_mut() {
+                    prefix.push_str(if done { "☑ " } else { "☐ " });
+                }
+            }
+            Event::Start(Tag::FootnoteDefinition(label)) => {
+                self.newline = true;
+                self.prefix = self.covers(at.start).then(|| format!("[{label}] "));
+            }
+            Event::Start(Tag::TableHead | Tag::TableRow) => {
+                self.newline = true;
+                self.tabs = 0;
+                self.cell = 0;
+            }
+            Event::Start(Tag::TableCell) => {
+                if self.cell > 0 && self.covers(at.start) {
+                    self.tabs += 1;
+                }
+                self.cell += 1;
+            }
+            // A cell all in the range keeps its place in the row even if it's
+            // empty, and so does a row of empty cells.
+            Event::End(TagEnd::TableCell) if self.range.as_ref().is_none_or(|r| r.start <= at.start && at.end <= r.end) => {
+                self.flush();
+            }
+            // An item with no text: its bullet isn't put before the text
+            // that comes after it.
+            Event::End(TagEnd::Item | TagEnd::FootnoteDefinition) => self.prefix = None,
+            Event::Start(
+                Tag::Paragraph
+                | Tag::Heading { .. }
+                | Tag::BlockQuote(_)
+                | Tag::CodeBlock(_)
+                | Tag::HtmlBlock
+                | Tag::MetadataBlock(_)
+                | Tag::Table(_),
+            ) => self.newline = true,
+            // The line break that ends the last line of a code block.
+            Event::End(TagEnd::CodeBlock | TagEnd::HtmlBlock | TagEnd::MetadataBlock(_)) => {
+                if self.out.ends_with('\n') {
+                    self.out.pop();
+                }
+            }
+            Event::Text(t) | Event::Code(t) | Event::InlineMath(t) | Event::DisplayMath(t) | Event::Html(t) => {
+                self.text(&t, at);
+            }
+            Event::FootnoteReference(label) => self.text(&format!("[{label}]"), at),
+            Event::SoftBreak | Event::HardBreak => {
+                if self.covers(at.start) {
+                    self.newline = true;
+                }
+            }
+            Event::InlineHtml(html) if html.trim().to_ascii_lowercase().starts_with("<br") && self.covers(at.start) => {
+                self.newline = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Text from the source at `at`: the part of it in the range.
+    fn text(&mut self, text: &str, at: Range<usize>) {
+        let src = self.src;
+        let text = match &self.range {
+            None => text,
+            Some(range) => {
+                let (start, end) = (at.start.max(range.start), at.end.min(range.end));
+                if start >= end {
+                    return;
+                }
+                match src.get(at.clone()).and_then(|s| s.find(text)) {
+                    // The source holds the text as it is (around it, maybe,
+                    // the backticks of code): the part of it selected.
+                    Some(offset) if !text.is_empty() => {
+                        let from = start.max(at.start + offset);
+                        let to = end.min(at.start + offset + text.len());
+                        if from >= to {
+                            return;
+                        }
+                        &src[from..to]
+                    }
+                    // Escapes and entities: all of it.
+                    _ => text,
+                }
+            }
+        };
+        if text.is_empty() {
+            return;
+        }
+        self.flush();
+        self.out.push_str(text);
+    }
+
+    /// Writes the line break, tabs and bullet due: before text, or for a
+    /// table cell with none.
+    fn flush(&mut self) {
+        if std::mem::take(&mut self.newline) && self.started {
+            self.out.push('\n');
+        }
+        for _ in 0..std::mem::take(&mut self.tabs) {
+            self.out.push('\t');
+        }
+        if let Some(prefix) = self.prefix.take() {
+            self.out.push_str(&prefix);
+        }
+        self.started = true;
+    }
 }
 
 fn table<'a>(src: &'a str, refs: &'a LinkRefs, out: &mut Rendered) {
@@ -570,6 +753,69 @@ mod tests {
         let out = render("![alt][photo]", &refs);
         assert_eq!(out.kind, Kind::Image);
         assert_eq!(out.image, Some(("photo.png".into(), "alt".into())));
+    }
+
+    fn plain(src: &str) -> String {
+        plain_text(src, &LinkRefs::new(), None)
+    }
+
+    /// `plain_text` of the part of `src` between the first `[` and `]`, which
+    /// are taken out first.
+    fn plain_part(marked: &str) -> String {
+        let start = marked.find('[').unwrap();
+        let end = marked.find(']').unwrap() - 1;
+        let src = marked.replacen('[', "", 1).replacen(']', "", 1);
+        plain_text(&src, &LinkRefs::new(), Some(start..end))
+    }
+
+    #[test]
+    fn plain_text_drops_the_markdown() {
+        assert_eq!(plain("## Hello **big** world"), "Hello big world");
+        assert_eq!(plain("Setext\n======"), "Setext");
+        assert_eq!(plain("A *b* __c__ ~~d~~ `e` [f](http://x) <u>u</u> \\*g\\* &amp; ![pic](p.png)"), "A b c d e f u *g* & pic");
+        assert_eq!(plain("soft\nbreak and hard  \nbreak<br>and br"), "soft\nbreak and hard\nbreak\nand br");
+        assert_eq!(plain("> quoted\n> lines\n>\n> > nested"), "quoted\nlines\nnested");
+        assert_eq!(plain("```rust\nfn main() {}\n\n```"), "fn main() {}\n");
+        assert_eq!(plain("    indented\n    code"), "indented\ncode");
+        assert_eq!(plain("![A photo](p.png)"), "A photo");
+        assert_eq!(plain("Note[^1].\n\n[^1]: The *note*."), "Note[1].\n[1] The note.");
+        assert_eq!(plain("---"), "");
+        assert_eq!(plain("[ref]: http://example.com"), "");
+        assert_eq!(plain("<div>\n<b>html</b>\n</div>"), "<div>\n<b>html</b>\n</div>");
+    }
+
+    #[test]
+    fn plain_text_keeps_bullets_numbers_and_cells() {
+        assert_eq!(plain("- a\n  - b\n    - c\n- d"), "• a\n  ◦ b\n    ▪ c\n• d");
+        assert_eq!(plain("3. three\n4. four"), "3. three\n4. four");
+        assert_eq!(plain("- [ ] open\n- [x] done"), "• ☐ open\n• ☑ done");
+        assert_eq!(plain("- loose\n\n  second paragraph\n\n- next"), "• loose\nsecond paragraph\n• next");
+        assert_eq!(plain("| a | b | c |\n|---|---|---|\n| 1 |  | 3 |\n|  | **2** |  |"), "a\tb\tc\n1\t\t3\n\t2\t");
+        // Empty rows and cells keep their place, for a spreadsheet.
+        assert_eq!(plain("| a | b |\n|---|---|\n|  |  |\n| 1 | 2 |"), "a\tb\n\t\n1\t2");
+        assert_eq!(plain("|  |\n|---|\n| 1 |"), "\n1");
+        // An empty item leaves no bullet for the text after it.
+        assert_eq!(plain("> - a\n> -\n>\n> para"), "• a\npara");
+        assert_eq!(plain("- a\n-\n\npara"), "• a\npara");
+    }
+
+    #[test]
+    fn plain_text_of_part_of_a_block() {
+        assert_eq!(plain_part("a **b[old** te]xt"), "old te");
+        assert_eq!(plain_part("a [**bold**] text"), "bold");
+        assert_eq!(plain_part("## [Title]"), "Title");
+        assert_eq!(plain_part("[## Title]"), "Title");
+        assert_eq!(plain_part("use `c[od]e` here"), "od");
+        assert_eq!(plain_part("[`]code`"), "");
+        assert_eq!(plain_part("- one\n- t[wo\n- three]"), "wo\n• three");
+        assert_eq!(plain_part("[- one\n- two]"), "• one\n• two");
+        assert_eq!(plain_part("1. one\n2. t[wo\n3. th]ree"), "wo\n3. th");
+        assert_eq!(plain_part("first\nsec[ond\nthi]rd"), "ond\nthi");
+        assert_eq!(plain_part("[line one\n]line two"), "line one");
+        assert_eq!(plain_part("```\na\n[b\nc]\nd\n```"), "b\nc");
+        assert_eq!(plain_part("| a | b |\n|---|---|\n| 1 | [2 |\n| 3 ]| 4 |"), "2\n3");
+        assert_eq!(plain_part("| a | b |\n|---|---|\n| [1 |  |\n|  |  |\n| 3 ]| 4 |"), "1\t\n\t\n3");
+        assert_eq!(plain_part("caf[é] au lait"), "é");
     }
 
     #[test]

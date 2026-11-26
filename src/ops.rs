@@ -82,8 +82,57 @@ pub fn run(doc: &Document, refs: &LinkRefs, i: usize, cmd: &str, text: &str, cur
             Kind::Code { fenced } => code_indent(text, fenced, cursor, anchor, cmd == "backtab"),
             _ => Action::Swallow,
         },
+        "pasted" => pasted(i, text, cursor),
         _ => Action::Swallow,
     }
+}
+
+/// The text field pasted text in front of `cursor`. When that leaves several
+/// blocks in the text, as a Markdown file does, they're split up, so that the
+/// others are shown rendered, and editing goes on in the one with the caret.
+/// Line breaks pasted as CR LF (or CR) become LF, as in a file that's opened.
+fn pasted(i: usize, text: &str, cursor: usize) -> Action {
+    let (text, cursor, rewritten) = if text.contains('\r') {
+        let before = unix_newlines(&text[..cursor]);
+        (format!("{before}{}", unix_newlines(&text[cursor..])), before.len(), true)
+    } else {
+        (text.to_owned(), cursor, false)
+    };
+    let (parts, edit, at) = split_at_caret(&text, cursor);
+    if parts.len() > 1 {
+        Action::Splice { start: i, removed: 1, parts, edit, cursor: at }
+    } else if rewritten {
+        Action::Replace { text, anchor: cursor, cursor }
+    } else {
+        Action::Pass
+    }
+}
+
+/// `text` with CR LF and lone CR line breaks as LF.
+pub fn unix_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Splits `text` into its blocks: their sources, which of them holds byte
+/// offset `caret`, and where it is in that one. A caret between two blocks
+/// goes to the start of the next one, and one after the last block to its end.
+pub fn split_at_caret(text: &str, caret: usize) -> (Vec<String>, usize, usize) {
+    let (prefix, blocks) = doc::split_blocks(text);
+    if blocks.is_empty() {
+        return (vec![String::new()], 0, 0);
+    }
+    let mut start = prefix.len();
+    let mut found = None;
+    for (k, block) in blocks.iter().enumerate() {
+        let end = start + block.src.len();
+        if found.is_none() && caret <= end {
+            found = Some((k, caret.saturating_sub(start)));
+        }
+        start = end + block.gap.len();
+    }
+    let last = blocks.len() - 1;
+    let (edit, at) = found.unwrap_or((last, blocks[last].src.len()));
+    (blocks.into_iter().map(|b| b.src).collect(), edit, at)
 }
 
 fn clamp(text: &str, pos: usize) -> usize {
@@ -805,6 +854,58 @@ mod tests {
         // An indented block keeps the indentation that makes it code.
         assert_eq!(replace(run(&d, 0, "backtab", "        a\n    b\n\t  c", 0, 19)).0, "    a\n    b\n\tc");
         assert_eq!(replace(run(&d, 0, "tab", "    a\n    b", 0, 11)).0, "        a\n        b");
+    }
+
+    #[test]
+    fn pasted_markdown_is_split_into_blocks() {
+        let d = doc("x\n");
+        // A file pasted into an empty block: editing goes on at its end.
+        let file = "# Title\n\nSome *text*.\n\n- a\n- b\n";
+        assert_eq!(
+            run(&d, 0, "pasted", file, file.len(), file.len()),
+            Action::Splice {
+                start: 0,
+                removed: 1,
+                parts: vec!["# Title".into(), "Some *text*.".into(), "- a\n- b".into()],
+                edit: 2,
+                cursor: 7
+            }
+        );
+        // Pasted in the middle of a paragraph: the caret stays where it was,
+        // in the block that holds the rest of the paragraph.
+        let text = "before one\n\ntwo after";
+        assert_eq!(
+            run(&d, 0, "pasted", text, 15, 15),
+            Action::Splice { start: 0, removed: 1, parts: vec!["before one".into(), "two after".into()], edit: 1, cursor: 3 }
+        );
+        // A caret between blocks is at the start of the next one.
+        assert_eq!(
+            run(&d, 3, "pasted", "a\n\n\n\nb", 4, 4),
+            Action::Splice { start: 3, removed: 1, parts: vec!["a".into(), "b".into()], edit: 1, cursor: 0 }
+        );
+        // Still one block, such as code pasted into a code block: the text
+        // field has already done it all.
+        assert_eq!(run(&d, 0, "pasted", "```\none\n\ntwo\n```", 13, 13), Action::Pass);
+        assert_eq!(run(&d, 0, "pasted", "one line", 8, 8), Action::Pass);
+    }
+
+    #[test]
+    fn pasted_line_breaks_become_lf() {
+        let d = doc("x\n");
+        assert_eq!(run(&d, 0, "pasted", "a\r\nb|", 4, 4), Action::Replace { text: "a\nb|".into(), anchor: 3, cursor: 3 });
+        assert_eq!(
+            run(&d, 0, "pasted", "a\r\n\r\nb\rc", 9, 9),
+            Action::Splice { start: 0, removed: 1, parts: vec!["a".into(), "b\nc".into()], edit: 1, cursor: 3 }
+        );
+    }
+
+    #[test]
+    fn split_at_caret_finds_the_block() {
+        assert_eq!(split_at_caret("", 0), (vec!["".into()], 0, 0));
+        assert_eq!(split_at_caret("\n\n  ", 2), (vec!["".into()], 0, 0));
+        assert_eq!(split_at_caret("\n\none\n\ntwo\n\n", 0), (vec!["one".into(), "two".into()], 0, 0));
+        assert_eq!(split_at_caret("one\n\ntwo\n\n", 10), (vec!["one".into(), "two".into()], 1, 3));
+        assert_eq!(split_at_caret("one\n\ntwo", 3), (vec!["one".into(), "two".into()], 0, 3));
     }
 
     #[test]

@@ -13,6 +13,21 @@ const H: u32 = 900;
 struct TestPlatform {
     window: Rc<MinimalSoftwareWindow>,
     start: Instant,
+    /// The clipboard, which the text fields copy to and paste from.
+    clipboard: RefCell<String>,
+}
+
+thread_local! {
+    /// The X11/Wayland primary selection of the test platform: what a text
+    /// field selects with the mouse, and a middle click pastes.
+    static PRIMARY: RefCell<String> = RefCell::default();
+}
+
+impl TestPlatform {
+    fn install(window: &Rc<MinimalSoftwareWindow>) {
+        let platform = TestPlatform { window: window.clone(), start: Instant::now(), clipboard: RefCell::default() };
+        slint::platform::set_platform(Box::new(platform)).unwrap();
+    }
 }
 
 impl Platform for TestPlatform {
@@ -21,6 +36,20 @@ impl Platform for TestPlatform {
     }
     fn duration_since_start(&self) -> Duration {
         self.start.elapsed()
+    }
+    fn set_clipboard_text(&self, text: &str, clipboard: slint::platform::Clipboard) {
+        match clipboard {
+            slint::platform::Clipboard::DefaultClipboard => *self.clipboard.borrow_mut() = text.to_owned(),
+            slint::platform::Clipboard::SelectionClipboard => PRIMARY.with(|p| *p.borrow_mut() = text.to_owned()),
+            _ => {}
+        }
+    }
+    fn clipboard_text(&self, clipboard: slint::platform::Clipboard) -> Option<String> {
+        match clipboard {
+            slint::platform::Clipboard::DefaultClipboard => Some(self.clipboard.borrow().clone()),
+            slint::platform::Clipboard::SelectionClipboard => Some(PRIMARY.with(|p| p.borrow().clone())),
+            _ => None,
+        }
     }
 }
 
@@ -79,8 +108,64 @@ impl Harness {
         let position = LogicalPosition::new(x, y);
         self.window.dispatch_event(WindowEvent::PointerMoved { position });
         self.settle();
-        self.window.dispatch_event(WindowEvent::PointerPressed { position, button: PointerEventButton::Left });
-        self.window.dispatch_event(WindowEvent::PointerReleased { position, button: PointerEventButton::Left });
+        self.button(position, true);
+        self.button(position, false);
+        self.settle();
+    }
+
+    /// The left button goes down or up at `position`. Tells the window first,
+    /// as the winit event hook does in the app.
+    fn button(&self, position: LogicalPosition, down: bool) {
+        let app = self.app.upgrade().unwrap();
+        let button = PointerEventButton::Left;
+        if down {
+            app.invoke_pointer_pressed(true);
+            self.window.dispatch_event(WindowEvent::PointerPressed { position, button });
+        } else {
+            app.invoke_pointer_released();
+            self.window.dispatch_event(WindowEvent::PointerReleased { position, button });
+        }
+    }
+
+    /// A middle click at `position`, which pastes the primary selection.
+    fn middle_click(&self, x: f32, y: f32) {
+        let position = LogicalPosition::new(x, y);
+        let button = PointerEventButton::Middle;
+        self.window.dispatch_event(WindowEvent::PointerMoved { position });
+        self.settle();
+        self.app.upgrade().unwrap().invoke_pointer_pressed(false);
+        self.window.dispatch_event(WindowEvent::PointerPressed { position, button });
+        self.settle();
+        self.window.dispatch_event(WindowEvent::PointerReleased { position, button });
+        self.settle();
+    }
+
+    /// Presses the left button at the first point, moves through the others
+    /// in steps, running the event loop after each, and lets go at the last.
+    fn drag(&self, path: &[(f32, f32)]) {
+        let at = |(x, y): (f32, f32)| LogicalPosition::new(x, y);
+        self.window.dispatch_event(WindowEvent::PointerMoved { position: at(path[0]) });
+        self.settle();
+        self.button(at(path[0]), true);
+        self.settle();
+        for pair in path.windows(2) {
+            let ((x0, y0), (x1, y1)) = (pair[0], pair[1]);
+            for step in 1..=6 {
+                let t = step as f32 / 6.0;
+                self.window.dispatch_event(WindowEvent::PointerMoved { position: at((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)) });
+                self.settle();
+            }
+        }
+        self.button(at(path[path.len() - 1]), false);
+        self.settle();
+    }
+
+    /// Holds `key` (Shift, say) while `f` runs.
+    fn holding(&self, key: Key, f: impl FnOnce()) {
+        let key: SharedString = key.into();
+        self.window.dispatch_event(WindowEvent::KeyPressed { text: key.clone() });
+        f();
+        self.window.dispatch_event(WindowEvent::KeyReleased { text: key });
         self.settle();
     }
 
@@ -126,7 +211,7 @@ fn shots() {
     let dir = PathBuf::from(std::env::var("SHOT_DIR").unwrap_or_else(|_| "target/shots".into()));
     std::fs::create_dir_all(&dir).unwrap();
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    TestPlatform::install(&window);
 
     let app = App::new().unwrap();
     if let Some(mono) = monospace_family() {
@@ -215,7 +300,7 @@ fn shots_typing() {
     let dir = PathBuf::from(std::env::var("SHOT_DIR").unwrap_or_else(|_| "target/shots".into()));
     std::fs::create_dir_all(&dir).unwrap();
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    TestPlatform::install(&window);
     let app = App::new().unwrap();
     window.set_size(PhysicalSize::new(W, H));
     let editor = Rc::new(RefCell::new(Editor::new(&app)));
@@ -287,17 +372,17 @@ fn shots_typing() {
 #[ignore]
 fn perf_large_document() {
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    TestPlatform::install(&window);
     let app = App::new().unwrap();
     window.set_size(PhysicalSize::new(W, H));
     let editor = Rc::new(RefCell::new(Editor::new(&app)));
     wire(&app, &editor);
     let sample = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/sample.md")).unwrap();
     let big = sample.repeat(60);
-    let path = std::env::temp_dir().join("linter-perf.md");
+    let path = std::env::temp_dir().join(format!("linter-perf-{}.md", std::process::id()));
     std::fs::write(&path, &big).unwrap();
     let t = Instant::now();
-    editor.borrow_mut().load(path);
+    editor.borrow_mut().load(path.clone());
     app.show().unwrap();
     let h = Harness { window, app: app.as_weak(), dir: std::env::temp_dir() };
     h.settle();
@@ -311,6 +396,30 @@ fn perf_large_document() {
     let t = Instant::now();
     h.key(SharedString::from(Key::Escape));
     println!("commit: {:?}", t.elapsed());
+
+    // The clipboard goes through a hidden text field, which lays the text out.
+    for (name, text) in [("sample x60", big.clone()), ("sample x600", sample.repeat(600))] {
+        std::fs::write(&path, &text).unwrap();
+        editor.borrow_mut().load(path.clone());
+        h.settle();
+        let t = Instant::now();
+        h.ctrl("a");
+        println!("{name}, {} KB: Ctrl+A {:?}", text.len() / 1024, t.elapsed());
+        let t = Instant::now();
+        h.ctrl("c");
+        println!("  Ctrl+C {:?}", t.elapsed());
+        let shift: SharedString = Key::Shift.into();
+        h.window.dispatch_event(WindowEvent::KeyPressed { text: shift.clone() });
+        let t = Instant::now();
+        h.ctrl("c");
+        println!("  Ctrl+Shift+C {:?}", t.elapsed());
+        h.window.dispatch_event(WindowEvent::KeyReleased { text: shift });
+        app.invoke_copy_text(text.as_str().into());
+        let t = Instant::now();
+        h.ctrl("v");
+        println!("  Ctrl+V over it all {:?}, {} blocks", t.elapsed(), editor.borrow().doc.blocks.len());
+    }
+    std::fs::remove_file(&path).unwrap();
 }
 
 /// Fixes from the code review that need the real UI. No screenshots, so it
@@ -321,7 +430,7 @@ fn shots_review() {
     let dir = std::env::temp_dir().join(format!("linter-review-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    TestPlatform::install(&window);
     let app = App::new().unwrap();
     window.set_size(PhysicalSize::new(W, H));
     let editor = Rc::new(RefCell::new(Editor::new(&app)));
@@ -422,7 +531,7 @@ fn shots_large_document() {
     let dir = std::env::temp_dir().join(format!("linter-large-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    TestPlatform::install(&window);
     let app = App::new().unwrap();
     window.set_size(PhysicalSize::new(W, H));
     let editor = Rc::new(RefCell::new(Editor::new(&app)));
@@ -562,7 +671,7 @@ fn shots_mixed_heights() {
     let dir = std::env::temp_dir().join(format!("linter-mixed-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    TestPlatform::install(&window);
     let app = App::new().unwrap();
     window.set_size(PhysicalSize::new(W, H));
     let editor = Rc::new(RefCell::new(Editor::new(&app)));
@@ -632,7 +741,7 @@ fn shots_focus() {
     let dir = std::env::temp_dir().join(format!("linter-focus-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    TestPlatform::install(&window);
     let app = App::new().unwrap();
     window.set_size(PhysicalSize::new(W, H));
     let editor = Rc::new(RefCell::new(Editor::new(&app)));
@@ -773,7 +882,7 @@ fn shots_theme() {
     let dir = PathBuf::from(std::env::var("SHOT_DIR").unwrap_or_else(|_| "target/shots".into()));
     std::fs::create_dir_all(&dir).unwrap();
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    TestPlatform::install(&window);
     let app = App::new().unwrap();
     app.set_version(env!("CARGO_PKG_VERSION").into());
     if let Some(mono) = monospace_family() {
@@ -925,7 +1034,7 @@ fn shots_images() {
     std::fs::write(&file, md).unwrap();
 
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    TestPlatform::install(&window);
     let app = App::new().unwrap();
     window.set_size(PhysicalSize::new(W, H));
     let editor = Rc::new(RefCell::new(Editor::new(&app)));
@@ -994,7 +1103,7 @@ fn shots_images_in_view() {
     let (top, end) = ([1, 2], [403, 404]);
 
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    TestPlatform::install(&window);
     let app = App::new().unwrap();
     window.set_size(PhysicalSize::new(W, H));
     let editor = Rc::new(RefCell::new(Editor::new(&app)));
@@ -1077,7 +1186,7 @@ fn shots_settings() {
     std::fs::write(&file, format!("# Settings\n\nSome text.\n\n![blog]({server}/page.png)\n")).unwrap();
 
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(TestPlatform { window: window.clone(), start: Instant::now() })).unwrap();
+    TestPlatform::install(&window);
     let app = App::new().unwrap();
     window.set_size(PhysicalSize::new(W, H));
     let editor = Rc::new(RefCell::new(Editor::new(&app)));
@@ -1166,4 +1275,464 @@ fn shots_settings() {
         "theme=light\n# hand-written\nreferer.127.0.0.1=https://blog.example/post\n"
     );
     let _ = std::fs::remove_dir_all(&docs);
+}
+
+/// Selecting blocks as a whole: dragging across them, Ctrl+A twice,
+/// Shift+click and Shift+Up/Down; what Ctrl+C, Ctrl+Shift+C, Ctrl+X, Delete
+/// and typing do with them; and pasting Markdown, which is split into blocks.
+/// Screenshots only with `SHOT_DIR`.
+#[test]
+#[ignore]
+fn shots_selection() {
+    let shots = std::env::var_os("SHOT_DIR").map(PathBuf::from);
+    let dir = std::env::temp_dir().join(format!("linter-selection-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    TestPlatform::install(&window);
+    let app = App::new().unwrap();
+    window.set_size(PhysicalSize::new(W, H));
+    let editor = Rc::new(RefCell::new(Editor::new(&app)));
+    wire(&app, &editor);
+    app.show().unwrap();
+    let h = Harness { window, app: app.as_weak(), dir: shots.clone().unwrap_or_else(|| dir.clone()) };
+    let snap = |name: &str| {
+        if shots.is_some() {
+            h.snap(name);
+        }
+    };
+    let open = |text: &str| {
+        let file = dir.join("selection.md");
+        std::fs::write(&file, text).unwrap();
+        editor.borrow_mut().load(file);
+        h.settle();
+    };
+    let selected = || editor.borrow().selected();
+    let editing = || editor.borrow().editing;
+    let srcs = || editor.borrow().doc.blocks.iter().map(|b| b.src.clone()).collect::<Vec<_>>();
+    let clipboard = || app.invoke_clipboard_text().to_string();
+    let shift = |f: &dyn Fn()| h.holding(Key::Shift, f);
+    let status = || app.get_status().to_string();
+
+    // Blocks, as rendered, at x = 300: 0 heading at y 82–150, 1 paragraph
+    // 154–185, 2 list 186–241, 3 quote 242–273, 4 code 274–329, 5 paragraph below.
+    let text = "# Title\n\nFirst paragraph with **bold** text.\n\n- one\n- two\n\n> quoted\n\n```\ncode\n```\n\nLast paragraph.\n";
+    let y = [110.0, 170.0, 205.0, 258.0, 300.0, 345.0];
+    open(text);
+
+    // Ctrl+A in a block selects its text, and once more the whole document.
+    h.click(300.0, y[1]);
+    assert_eq!(editing(), Some(1));
+    h.ctrl("a");
+    assert_eq!(selected(), None, "the first Ctrl+A selects the text of the block");
+    assert_eq!(status(), "Press Ctrl+A again to select the whole document");
+    h.ctrl("a");
+    assert_eq!(selected(), Some(0..=5));
+    assert_eq!(editing(), None);
+    assert_eq!(app.get_sel_first(), 0);
+    assert_eq!(app.get_sel_last(), 5);
+    snap("sel1-all");
+    // Ctrl+C copies the Markdown, Ctrl+Shift+C the text as it reads.
+    h.ctrl("c");
+    assert_eq!(clipboard(), text.trim_end());
+    assert_eq!(status(), "Copied 6 blocks as Markdown");
+    shift(&|| h.ctrl("c"));
+    assert_eq!(clipboard(), "Title\n\nFirst paragraph with bold text.\n\n• one\n• two\n\nquoted\n\ncode\n\nLast paragraph.");
+    assert_eq!(status(), "Copied 6 blocks as plain text");
+    h.key(Key::Escape);
+    assert_eq!(selected(), None);
+    assert_eq!(app.get_sel_first(), -1);
+
+    // A drag from the text of one block on to others selects them whole.
+    h.drag(&[(300.0, y[1]), (300.0, y[3])]);
+    assert_eq!(selected(), Some(1..=3));
+    assert_eq!(editing(), None, "editing stopped once the drag left the block");
+    snap("sel2-dragged");
+    app.invoke_apply_theme(true);
+    snap("sel2-dragged-dark");
+    app.invoke_apply_theme(false);
+    h.ctrl("c");
+    assert_eq!(clipboard(), "First paragraph with **bold** text.\n\n- one\n- two\n\n> quoted");
+    // Shift+Down and Shift+Up move its end.
+    shift(&|| h.key(Key::DownArrow));
+    assert_eq!(selected(), Some(1..=4));
+    shift(&|| {
+        for _ in 0..4 {
+            h.key(Key::UpArrow);
+        }
+    });
+    assert_eq!(editor.borrow().selection, Some((1, 0)), "past the start of the drag");
+    // Tab doesn't move the focus on to a block.
+    h.key(Key::Tab);
+    assert_eq!((editor.borrow().selection, editing()), (Some((1, 0)), None));
+    // Down without Shift edits the last block selected.
+    h.key(Key::DownArrow);
+    assert_eq!((selected(), editing()), (None, Some(1)));
+    h.key(Key::Escape);
+
+    // Within one block, a drag selects text, as before, and Ctrl+Shift+C
+    // copies it without the Markdown.
+    h.drag(&[(200.0, y[1]), (420.0, y[1])]);
+    assert_eq!((selected(), editing()), (None, Some(1)));
+    shift(&|| h.ctrl("c"));
+    let copied = clipboard();
+    assert!(copied.contains("bold") && !copied.contains('*'), "{copied:?}");
+    assert_eq!(status(), "Copied the selection as plain text");
+    h.key(Key::Escape);
+
+    // A drag from the margin that comes back to its block ends with that
+    // block selected: the release isn't a click on the margin.
+    h.drag(&[(40.0, y[1]), (40.0, y[3]), (40.0, y[1] + 4.0)]);
+    assert_eq!(selected(), Some(1..=1));
+    h.click(40.0, y[1]);
+    assert_eq!(selected(), None, "a click in the margin drops the selection");
+
+    // Shift+click extends from the block being edited, and again from the
+    // same start; a click without Shift edits the block clicked.
+    h.click(300.0, y[5]);
+    assert_eq!(editing(), Some(5));
+    shift(&|| h.click(300.0, y[1]));
+    assert_eq!(editor.borrow().selection, Some((5, 1)));
+    shift(&|| h.click(300.0, y[3]));
+    assert_eq!(editor.borrow().selection, Some((5, 3)));
+    // The text field clicked on doesn't keep the focus: keys act on the
+    // selection, and none reaches the block's hidden text.
+    shift(&|| h.key(Key::UpArrow));
+    assert_eq!(editor.borrow().selection, Some((5, 2)));
+    h.click(300.0, y[3]);
+    assert_eq!((selected(), editing()), (None, Some(3)));
+    assert_eq!(srcs(), text.trim_end().split("\n\n").collect::<Vec<_>>());
+    h.key(Key::Escape);
+    // Shift+click in the margin extends too.
+    h.click(300.0, y[1]);
+    shift(&|| h.click(40.0, y[2]));
+    assert_eq!(editor.borrow().selection, Some((1, 2)));
+    h.key(Key::Escape);
+
+    // Shift+Down at the end of a block selects it and the next one.
+    h.click(300.0, y[1]);
+    h.key(Key::End);
+    shift(&|| h.key(Key::DownArrow));
+    assert_eq!(editor.borrow().selection, Some((1, 2)));
+    shift(&|| h.key(Key::DownArrow));
+    assert_eq!(editor.borrow().selection, Some((1, 3)));
+
+    // Delete removes them, leaving an empty paragraph to type in.
+    h.key(Key::Delete);
+    assert_eq!(srcs(), ["# Title", "", "```\ncode\n```", "Last paragraph."]);
+    assert_eq!(editing(), Some(1));
+    h.type_text("New");
+    assert_eq!(srcs()[1], "New");
+    // Ctrl+Z: the text field undoes the typing, then the blocks come back,
+    // selected.
+    h.ctrl("z");
+    assert_eq!(srcs()[1], "");
+    h.ctrl("z");
+    assert_eq!(srcs(), text.trim_end().split("\n\n").collect::<Vec<_>>());
+    assert_eq!((editor.borrow().selection, editing()), (Some((1, 3)), None));
+    assert!(!editor.borrow().modified);
+    h.ctrl("z");
+    assert_eq!(srcs().len(), 6, "once");
+    h.key(Key::Escape);
+
+    // Ctrl+X cuts; the empty paragraph left goes once editing stops.
+    open(text);
+    h.drag(&[(300.0, y[2]), (300.0, y[4])]);
+    assert_eq!(selected(), Some(2..=4));
+    h.ctrl("x");
+    assert_eq!(clipboard(), "- one\n- two\n\n> quoted\n\n```\ncode\n```");
+    assert_eq!(status(), "Cut 3 blocks");
+    assert_eq!(srcs(), ["# Title", "First paragraph with **bold** text.", "", "Last paragraph."]);
+    h.key(Key::Escape);
+    assert_eq!(srcs(), ["# Title", "First paragraph with **bold** text.", "Last paragraph."]);
+    assert!(editor.borrow().modified);
+    // Ctrl+Z after leaving the block brings them back too.
+    h.ctrl("z");
+    assert_eq!(srcs().len(), 6);
+    assert_eq!(selected(), Some(2..=4));
+    h.ctrl("x");
+    h.key(Key::Escape);
+
+    // Typing replaces the blocks selected.
+    h.drag(&[(300.0, y[1]), (300.0, 200.0)]);
+    assert_eq!(selected(), Some(1..=2));
+    h.type_text("ZY");
+    assert_eq!(srcs(), ["# Title", "ZY"]);
+    assert_eq!(editing(), Some(1));
+
+    // Ctrl+V over them: the text pasted, as blocks. Editing goes on at its end.
+    app.invoke_copy_text("## Pasted\r\n\r\nOne *two*\r\n\r\n- three".into());
+    h.ctrl("a");
+    h.ctrl("a");
+    assert_eq!(selected(), Some(0..=1));
+    h.ctrl("v");
+    assert_eq!(srcs(), ["## Pasted", "One *two*", "- three"]);
+    assert_eq!(editing(), Some(2));
+    h.type_text("!");
+    assert_eq!(srcs()[2], "- three!");
+    h.key(Key::Escape);
+
+    // A Markdown file pasted into a new document is shown as its blocks,
+    // rendered but for the last one, where editing goes on.
+    open("");
+    assert_eq!(editing(), Some(0));
+    let file = "# Notes\n\nA paragraph with `code`.\n\n1. first\n2. second\n\n```js\nlet x = 1;\n```\n\nThe end.\n";
+    app.invoke_copy_text(file.into());
+    h.ctrl("v");
+    assert_eq!(srcs(), ["# Notes", "A paragraph with `code`.", "1. first\n2. second", "```js\nlet x = 1;\n```", "The end."]);
+    assert_eq!(editing(), Some(4));
+    // Ctrl+Z takes the paste back, and it can be pasted again.
+    h.ctrl("z");
+    assert_eq!((srcs(), editing()), (vec![String::new()], Some(0)));
+    h.ctrl("v");
+    assert_eq!(srcs().len(), 5);
+    let kinds: Vec<_> = (0..5).map(|i| editor.borrow().model.row_data(i).unwrap().kind).collect();
+    assert_eq!(kinds, [BlockKind::Heading, BlockKind::Paragraph, BlockKind::List, BlockKind::Code, BlockKind::Paragraph]);
+    h.type_text("..");
+    assert_eq!(srcs()[4], "The end...");
+    snap("sel3-pasted");
+    h.key(Key::Escape);
+    assert_eq!(editor.borrow().doc.to_text(), file.replace("The end.", "The end..."));
+
+    // Pasted into the middle of a paragraph: the caret stays after what was pasted.
+    open("Hello world.\n");
+    h.click(300.0, 82.0);
+    h.key(Key::Home);
+    for _ in 0.."Hello ".len() {
+        h.key(Key::RightArrow);
+    }
+    app.invoke_copy_text("there.\n\n## Middle\n\nAnd ".into());
+    h.ctrl("v");
+    assert_eq!(srcs(), ["Hello there.", "## Middle", "And world."]);
+    assert_eq!(editing(), Some(2));
+    h.type_text("X");
+    assert_eq!(srcs()[2], "And Xworld.");
+    // Undone, the caret is back where the paste went.
+    h.ctrl("z");
+    h.ctrl("z");
+    assert_eq!((srcs(), editing()), (vec!["Hello world.".to_owned()], Some(0)));
+    h.type_text("big ");
+    assert_eq!(srcs()[0], "Hello big world.");
+    h.key(Key::Escape);
+
+    // Code pasted into a code block stays code.
+    open("```\n\n```\n");
+    h.click(300.0, 82.0);
+    h.key(Key::Home);
+    h.key(Key::DownArrow);
+    app.invoke_copy_text("a\n\nb".into());
+    h.ctrl("v");
+    assert_eq!(srcs(), ["```\na\n\nb\n```"]);
+    h.key(Key::Escape);
+
+    // A drag below the list scrolls it, and the selection grows with it.
+    let long: String = (0..400).map(|i| format!("Paragraph {i}.\n\n")).collect();
+    open(&long);
+    let start = LogicalPosition::new(300.0, 100.0);
+    h.window.dispatch_event(WindowEvent::PointerMoved { position: start });
+    h.settle();
+    h.button(start, true);
+    h.settle();
+    h.window.dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(300.0, 700.0) });
+    h.settle();
+    let before = *selected().expect("blocks are selected").end();
+    h.window.dispatch_event(WindowEvent::PointerMoved { position: LogicalPosition::new(300.0, H as f32 + 60.0) });
+    h.wait();
+    let after = *selected().unwrap().end();
+    assert!(after > before + 5, "the list scrolled while the button was held: {before} -> {after}");
+    h.button(LogicalPosition::new(300.0, H as f32 + 60.0), false);
+    h.settle();
+    assert_eq!(*selected().unwrap().start(), 0);
+    let end = *selected().unwrap().end();
+    h.wait();
+    assert_eq!(*selected().unwrap().end(), end, "scrolling stops with the release");
+
+    // Dragging the scroll bar scrolls without selecting.
+    h.key(Key::Escape);
+    h.drag(&[(W as f32 - 5.0, 120.0), (W as f32 - 5.0, 400.0)]);
+    assert_eq!(selected(), None);
+
+    // Ctrl+A with nothing edited selects the document: here a table taller
+    // than the software renderer can clip, which is drawn selected while
+    // the list scrolls past it.
+    let mut table = String::from("| a | b |\n| - | - |\n");
+    for i in 0..1200 {
+        table.push_str(&format!("| {i} | x |\n"));
+    }
+    open(&format!("{table}\nafter\n"));
+    assert_eq!(editing(), None);
+    h.ctrl("a");
+    assert_eq!(selected(), Some(0..=1));
+    h.scroll(-30000.0);
+    h.scroll(-1_000_000.0);
+    h.scroll(1_000_000.0);
+    assert_eq!(selected(), Some(0..=1));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    println!("selection checks passed");
+}
+
+/// Fixes from the review of selecting blocks, pasting and undoing. No
+/// screenshots.
+#[test]
+#[ignore]
+fn shots_selection_review() {
+    let dir = std::env::temp_dir().join(format!("linter-selection-review-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    TestPlatform::install(&window);
+    let app = App::new().unwrap();
+    window.set_size(PhysicalSize::new(W, H));
+    let editor = Rc::new(RefCell::new(Editor::new(&app)));
+    wire(&app, &editor);
+    app.show().unwrap();
+    let h = Harness { window, app: app.as_weak(), dir: dir.clone() };
+    let open = |text: &str| {
+        let file = dir.join("review.md");
+        std::fs::write(&file, text).unwrap();
+        editor.borrow_mut().load(file);
+        h.settle();
+    };
+    let selected = || editor.borrow().selected();
+    let editing = || editor.borrow().editing;
+    let srcs = || editor.borrow().doc.blocks.iter().map(|b| b.src.clone()).collect::<Vec<_>>();
+    let shift = |f: &dyn Fn()| h.holding(Key::Shift, f);
+    let primary = || PRIMARY.with(|p| p.borrow().clone());
+    // The rows show the document as it is.
+    let rows_match = || {
+        let ed = editor.borrow();
+        ed.model.row_count() == ed.doc.blocks.len()
+            && ed.doc.blocks.iter().enumerate().all(|(i, b)| ed.model.row_data(i).unwrap().source.as_str() == b.src)
+    };
+
+    // Shift+Up from a new, empty block selects the block above it, and only
+    // that one: the empty block is gone once editing stops.
+    open("A\n\nB\n\nC\n");
+    h.click(300.0, 82.0);
+    assert_eq!(editing(), Some(0));
+    h.key(Key::End);
+    h.key(Key::Return);
+    assert_eq!(srcs(), ["A", "", "B", "C"]);
+    assert_eq!(editing(), Some(1));
+    shift(&|| h.key(Key::UpArrow));
+    assert_eq!(selected(), Some(0..=0));
+    assert_eq!(srcs(), ["A", "B", "C"]);
+    h.key(Key::Delete);
+    assert_eq!(srcs(), ["", "B", "C"]);
+    h.key(Key::Escape);
+
+    // So does a drag upward from it, and it goes on from where that block is.
+    open("A\n\nB\n\nC\n");
+    editor.borrow_mut().request_edit(Some(0), Some(Cursor::End));
+    h.settle();
+    h.key(Key::Return);
+    assert_eq!(editing(), Some(1));
+    editor.borrow_mut().button_pressed(true);
+    editor.borrow_mut().drag_over(1);
+    editor.borrow_mut().drag_over(0);
+    assert_eq!(selected(), Some(0..=0));
+    editor.borrow_mut().drag_over(0);
+    assert_eq!(selected(), Some(0..=0));
+    editor.borrow_mut().drag_over(1);
+    assert_eq!(selected(), Some(0..=1));
+    assert_eq!(srcs(), ["A", "B", "C"]);
+    h.key(Key::Escape);
+
+    // Ctrl+Z after a paste that split a block puts the block back as it was,
+    // and it's finished as it would have been: the fence typed in it closes.
+    open("");
+    h.type_text("```js");
+    h.key(Key::Home);
+    app.invoke_copy_text("Intro\n\n".into());
+    h.ctrl("v");
+    assert_eq!(srcs(), ["Intro", "```js"]);
+    h.ctrl("z");
+    assert_eq!(srcs(), ["```js"]);
+    assert_eq!(editing(), Some(0));
+    assert!(rows_match());
+    h.key(Key::Escape);
+    assert_eq!(editor.borrow().doc.to_text(), "```js\n```\n");
+
+    // A paste whose CR LF line breaks became LF stays one block, and Ctrl+Z
+    // takes it back, after what was typed since.
+    open("Hello world.\n");
+    h.click(300.0, 82.0);
+    h.key(Key::End);
+    app.invoke_copy_text(" a\r\nb".into());
+    h.ctrl("v");
+    assert_eq!(srcs(), ["Hello world. a\nb"]);
+    h.type_text("X");
+    h.ctrl("z");
+    assert_eq!(srcs(), ["Hello world. a\nb"]);
+    h.ctrl("z");
+    assert_eq!(srcs(), ["Hello world."]);
+    assert_eq!(editing(), Some(0));
+    h.type_text("!");
+    assert_eq!(srcs(), ["Hello world.!"], "the caret is back where the paste went");
+    h.key(Key::Escape);
+
+    // A character deleted and typed again is two edits for Ctrl+Z to undo
+    // before it undoes the paste.
+    open("");
+    app.invoke_copy_text("# Notes\n\nText".into());
+    h.ctrl("v");
+    assert_eq!(srcs(), ["# Notes", "Text"]);
+    h.key(Key::Backspace);
+    h.type_text("t");
+    h.ctrl("z");
+    assert_eq!(srcs(), ["# Notes", "Tex"], "Ctrl+Z undid the last keystroke");
+    h.ctrl("z");
+    assert_eq!(srcs(), ["# Notes", "Text"]);
+    h.ctrl("z");
+    assert_eq!(srcs(), [""]);
+    assert!(rows_match());
+
+    // A paste that no longer applies (the block was changed in a way the text
+    // field can't undo) is forgotten.
+    app.invoke_copy_text("A\n\nB".into());
+    h.ctrl("v");
+    assert_eq!(srcs(), ["A", "B"]);
+    editor.borrow_mut().request_edit(Some(0), Some(Cursor::End));
+    h.settle();
+    h.ctrl("b");
+    assert_eq!(srcs(), ["A****", "B"]);
+    h.ctrl("z");
+    assert_eq!(srcs(), ["A****", "B"]);
+    assert!(editor.borrow().undo.is_none());
+    h.key(Key::Escape);
+
+    // Blocks, as rendered, at x = 300 (see shots_selection).
+    let text = "# Title\n\nFirst paragraph with **bold** text.\n\n- one\n- two\n\n> quoted\n\n```\ncode\n```\n\nLast paragraph.\n";
+    let y = [110.0, 170.0, 205.0, 258.0, 300.0, 345.0];
+    open(text);
+
+    // A drag from the middle of a block's text on to other blocks leaves the
+    // primary selection as it was.
+    PRIMARY.with(|p| *p.borrow_mut() = "before".into());
+    h.drag(&[(200.0, y[1]), (380.0, y[3])]);
+    assert_eq!(selected(), Some(1..=3));
+    assert_eq!(primary(), "before");
+    // A middle click after it edits the block clicked, and pastes there.
+    h.middle_click(300.0, y[5]);
+    assert_eq!((selected(), editing()), (None, Some(5)));
+    assert!(srcs()[5].contains("before"), "{:?}", srcs()[5]);
+    h.key(Key::Escape);
+
+    // Shift+middle click selects up to the block instead of editing it, and
+    // what it pastes into the block's hidden text doesn't reach the document.
+    h.click(300.0, y[5]);
+    let before = srcs();
+    shift(&|| h.middle_click(300.0, y[1]));
+    assert_eq!((selected(), editing()), (Some(1..=5), None));
+    assert_eq!(srcs(), before);
+    h.key(Key::Escape);
+
+    // With no scroll bar, a drag can start at the right edge too, and a click
+    // there after a drag drops the selection.
+    h.drag(&[(W as f32 - 5.0, y[1]), (W as f32 - 5.0, y[3])]);
+    assert_eq!(selected(), Some(1..=3));
+    h.click(W as f32 - 5.0, y[5]);
+    assert_eq!((selected(), editing()), (None, None));
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    println!("selection review checks passed");
 }

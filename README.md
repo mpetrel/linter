@@ -17,6 +17,9 @@ again.
 - **Images** from files and the web, in all the common formats, loaded in the background.
 - **Long documents:** only the blocks in view are built, so memory use doesn't grow with
   the length of the file.
+- **Select, copy and paste across blocks:** drag over several blocks or press `Ctrl+A`
+  twice, then copy them as Markdown or as plain text, cut, delete or type over them. A
+  Markdown document pasted in shows as its blocks right away.
 - **Keyboard shortcuts** for headings, bold and italic, list indent, and moving between
   blocks.
 - **Light and dark themes**, and a Windows installer.
@@ -50,6 +53,44 @@ The *Theme* menu at the right of the toolbar switches between the light and dark
 (`%APPDATA%\linter\settings` on Windows, `~/Library/Application Support/linter/settings`
 on macOS), a text file of `key=value` lines. *About* shows the version and the Slint
 attribution.
+
+## Selecting, copying and pasting
+
+Inside the block being edited, text is selected, copied (`Ctrl+C`), cut and pasted as in
+any text field. That is its Markdown, as you see it there.
+
+To work with several blocks, select them as a whole:
+
+- **Drag** from one block on to others (from its text or from the margin beside it). The
+  blocks from the first to the one under the pointer are selected; dragging above or below
+  the window scrolls the document.
+- **`Ctrl+A`** selects all of the block being edited; pressed again, the whole document.
+  With no block being edited, the first press selects the whole document.
+- **`Shift`+click** a block to select from the block being edited, or from the start of
+  the selection, to that one. **`Shift+↑` / `Shift+↓`** at the start / end of the block
+  being edited select it and the block before / after it, and then move the end of the
+  selection one block at a time.
+
+With blocks selected:
+
+| Key | |
+| --- | --- |
+| `Ctrl+C` | Copy their Markdown, as it is in the file. |
+| `Ctrl+Shift+C` | Copy their text as it reads: no `#`, `**`, `>` or fences; bullets and numbers kept (`•`, `1.`), tasks as ☐ / ☑, table cells separated by tabs, a blank line between blocks. In the block being edited, it copies the selected text the same way. |
+| `Ctrl+X` | Cut them (as Markdown). |
+| `Delete` / `Backspace` | Delete them, leaving an empty paragraph to type in. |
+| Typing, `Ctrl+V` | Replace them with what's typed or pasted. |
+| `↑` / `↓` (or `←` / `→`, `Enter`) | Edit the first / last of them. |
+| `Esc`, or a click | Drop the selection. |
+
+**Pasting Markdown:** `Ctrl+V` in a block pastes the text, and if it holds several blocks
+(a paragraph, then a list, say) they're shown rendered at once, the way the file will read,
+and editing goes on where the paste ended. Code pasted into a code block stays code. Line
+breaks pasted as CR LF become LF.
+
+**Undo:** `Ctrl+Z` right after deleting, cutting, typing or pasting over selected blocks,
+or after a paste that was split into blocks or whose line breaks became LF, puts the
+document back as it was. Anything typed since is undone first.
 
 ## Files
 
@@ -161,7 +202,12 @@ make a line break).
 - Links aren't opened on click (a click edits the block). An image inside a line of text
   is shown as its alt text.
 - Undo (`Ctrl+Z`) works within the block being edited, not across blocks. It starts over
-  when that block scrolls out of view and back.
+  when that block scrolls out of view and back. Changes to several blocks at once
+  (deleting or pasting over selected blocks, a paste split into blocks) can be undone
+  once, right after (see [Selecting, copying and pasting](#selecting-copying-and-pasting)),
+  but not redone.
+- Blocks are selected as a whole: a selection that goes beyond one block takes in all of
+  the first and last blocks, not part of them.
 - Tables and code blocks are edited as plain text.
 
 ## Code layout
@@ -170,10 +216,11 @@ make a line break).
   re-splits edited text.
 - `src/images.rs`: loads, downloads and decodes images on worker threads.
 - `src/render.rs`: turns a block into display data. Inline Markdown is re-emitted in the
-  subset Slint's `StyledText` supports.
-- `src/ops.rs`: keyboard commands (Enter, merge, heading levels, list indent, …) as pure
-  functions.
-- `src/main.rs`: Slint glue, files, drag and drop, unsaved-changes prompt.
+  subset Slint's `StyledText` supports. Also the plain text that `Ctrl+Shift+C` copies.
+- `src/ops.rs`: keyboard commands (Enter, merge, heading levels, list indent, splitting a
+  paste into blocks, …) as pure functions.
+- `src/main.rs`: Slint glue, files, drag and drop, selecting blocks and the clipboard,
+  unsaved-changes prompt.
 - `ui/app.slint`: the UI. The document is a `ListView`, so only the blocks in view exist as
   UI elements, and memory use doesn't grow with the length of the file. The block being
   edited can scroll out of view: keys keep working, and typing brings it back.
@@ -193,6 +240,8 @@ cargo test shots::shots_images_in_view -- --exact --ignored       # images load 
 SHOT_DIR=/tmp/shots cargo test shots::shots_theme -- --exact --ignored   # theme menu, dark theme, About
 SHOT_DIR=/tmp/shots cargo test shots::shots_images -- --exact --ignored  # images: formats, web, errors
 SHOT_DIR=/tmp/shots cargo test shots::shots_settings -- --exact --ignored  # Settings: Referer rules
+cargo test shots::shots_selection -- --exact --ignored            # selecting blocks, clipboard, pasting
+cargo test shots::shots_selection_review -- --exact --ignored     # selection, paste and undo regressions
 ```
 
 The ignored `shots*` tests drive the real UI with simulated clicks and keys through

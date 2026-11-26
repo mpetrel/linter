@@ -10,6 +10,7 @@ mod shots;
 
 use doc::{Change, Document, Kind, LinkRefs};
 use ops::{Action, Cursor};
+use slint::platform::Key;
 use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, SharedString, StyledText, VecModel};
 use std::cell::{Cell as StdCell, RefCell};
 use std::path::{Path, PathBuf};
@@ -54,6 +55,37 @@ enum Pending {
     Close,
 }
 
+/// The document as it was before a change the text field can't undo by
+/// itself: selected blocks deleted or replaced, a paste split into blocks,
+/// or one whose line breaks were rewritten. Ctrl+Z puts it back once the text
+/// field has nothing left to undo (see `Editor::undo_blocks`).
+struct Undo {
+    doc: Document,
+    was: Was,
+    /// The file as the change left it (see `Editor::file_text`): the undo
+    /// only applies while the document still reads that way.
+    after: String,
+}
+
+/// What was selected or edited before the change.
+enum Was {
+    /// Blocks selected, as `Editor::selection`.
+    Selected(usize, usize),
+    /// The block edited, the caret in it, and `Editor::original` then.
+    Editing { block: usize, caret: usize, original: String },
+}
+
+/// Ctrl+V was pressed in a block: what a paste into it that the text field
+/// can't undo puts back.
+struct PasteFrom {
+    block: usize,
+    /// Its text, and the caret (or the start of the selection) in it.
+    text: String,
+    caret: usize,
+    /// `Editor::original` then.
+    original: String,
+}
+
 struct Editor {
     ui: slint::Weak<App>,
     doc: Document,
@@ -81,6 +113,19 @@ struct Editor {
     /// edited that only its text field can handle, with the modifiers held
     /// and when they were pressed. They're replayed when it has the focus again.
     held_keys: Vec<HeldKey>,
+    /// Blocks selected as a whole, from the first one selected (the anchor) to
+    /// the one the selection was extended to. No block is edited meanwhile.
+    selection: Option<(usize, usize)>,
+    /// The block the drag with the mouse button held started on, once the
+    /// pointer was over one.
+    drag_origin: Option<usize>,
+    /// The drag since the button went down selected blocks: the click its
+    /// release makes isn't a click on the block or the space it ends on.
+    dragged: bool,
+    /// How to undo the last change to several blocks at once.
+    undo: Option<Undo>,
+    /// The block Ctrl+V was last pressed in, as it was then.
+    paste_from: Option<PasteFrom>,
 }
 
 impl Editor {
@@ -105,6 +150,11 @@ impl Editor {
             images: images::Images::new(),
             rendered_width: StdCell::new(0),
             held_keys: Vec::new(),
+            selection: None,
+            drag_origin: None,
+            dragged: false,
+            undo: None,
+            paste_from: None,
         };
         editor.rendered_width.set(editor.image_width());
         editor.rebuild();
@@ -342,7 +392,16 @@ impl Editor {
         };
         self.apply_change(change);
         self.refresh_meta();
-        change.inserted as isize - change.removed as isize
+        // A drag can start on another block and commit this one. If it
+        // started on this one and that's gone or split up, the drag starts
+        // again from the block the pointer is over next (see `drag_over`).
+        let n = change.inserted;
+        self.drag_origin = self.drag_origin.and_then(|o| match o.cmp(&i) {
+            std::cmp::Ordering::Less => Some(o),
+            std::cmp::Ordering::Greater => Some(o + n - 1),
+            std::cmp::Ordering::Equal => (n == 1).then_some(o),
+        });
+        n as isize - 1
     }
 
     fn update_modified(&mut self) {
@@ -366,6 +425,7 @@ impl Editor {
     /// Switches edit mode to `target` (an index from before the current block
     /// is committed), or leaves edit mode with `None`.
     fn request_edit(&mut self, target: Option<usize>, cursor: Option<Cursor>) {
+        self.clear_selection();
         if target.is_some() && target == self.editing {
             return;
         }
@@ -467,14 +527,67 @@ impl Editor {
         if self.doc.blocks[i].src != text {
             self.edited(i, text);
         }
+        let (start, end) = (char_boundary(text, cursor.min(anchor)), char_boundary(text, cursor.max(anchor)));
+        // The block as it was before the paste that the text field just did.
+        let mut pasted_into = None;
+        match cmd {
+            // Ctrl+Z once the text field has nothing left to undo.
+            "undo" => return if self.undo_blocks() { handled } else { pass },
+            // Ctrl+V, before the text field pastes.
+            "paste" => {
+                let original = self.original.clone();
+                self.paste_from = Some(PasteFrom { block: i, text: text.to_owned(), caret: start, original });
+                return pass;
+            }
+            "pasted" => pasted_into = self.paste_from.take().filter(|p| p.block == i),
+            // Ctrl+A: the text field selects all of the block; once it has,
+            // or if there's nothing in it, the whole document is selected.
+            "select-all" => {
+                if start == 0 && end >= text.len() {
+                    self.select_all();
+                    return handled;
+                }
+                if self.doc.blocks.len() > 1 {
+                    self.set_status("Press Ctrl+A again to select the whole document", false);
+                }
+                return pass;
+            }
+            "copy-plain" => {
+                if start < end {
+                    let plain = render::plain_text(text, &self.refs, Some(start..end));
+                    self.copy_as(&plain, "the selection", "plain text");
+                }
+                return handled;
+            }
+            // Shift+Up at the start of the block, Shift+Down at its end: the
+            // block and the one before or after it are selected.
+            "select-up" | "select-down" => {
+                let up = cmd == "select-up";
+                if cursor != if up { 0 } else { text.len() } {
+                    return pass;
+                }
+                let to = if up { i.saturating_sub(1) } else { (i + 1).min(self.doc.blocks.len() - 1) };
+                self.select_blocks(i, to);
+                self.show_selection_end();
+                return handled;
+            }
+            _ => {}
+        }
         match ops::run(&self.doc, &self.refs, i, cmd, text, cursor, anchor) {
             Action::Pass => pass,
             Action::Swallow => handled,
             Action::Replace { text, anchor, cursor } => {
+                // A paste whose line breaks were rewritten: the text field
+                // forgets what it could undo when its text is set.
+                let before = pasted_into.map(|p| self.before_paste(p));
                 self.set_block_text(i, text.clone());
+                if let Some((doc, was)) = before {
+                    self.undo = Some(Undo { doc, was, after: self.file_text() });
+                }
                 EditResult { action: 2, text: text.into(), anchor: anchor as i32, cursor: cursor as i32 }
             }
             Action::Splice { start, removed, parts, edit, cursor } => {
+                let before = pasted_into.map(|p| self.before_paste(p));
                 self.editing = None;
                 let (change, keep) = self.doc.splice(start, removed, parts, Some(edit));
                 self.update_modified();
@@ -485,6 +598,9 @@ impl Editor {
                 // key is typed.
                 self.original.clear();
                 self.refresh_meta();
+                if let Some((doc, was)) = before {
+                    self.undo = Some(Undo { doc, was, after: self.file_text() });
+                }
                 handled
             }
             Action::Move { to, cursor } => {
@@ -499,17 +615,29 @@ impl Editor {
     }
 
     /// Click on empty space beside or above the document: stop editing, so
-    /// the whole document is shown rendered.
+    /// the whole document is shown rendered, and drop the selection.
     fn click_blank(&mut self) {
+        if self.dragged {
+            return;
+        }
+        self.clear_selection();
+        self.leave_edit();
+    }
+
+    /// Stops editing, if a block is being edited.
+    fn leave_edit(&mut self) {
         if self.editing.is_some() {
             self.request_edit(None, None);
         }
     }
 
-    /// Click below the last block: stop editing, like any other blank space.
-    /// When nothing is being edited, continue writing at the end.
+    /// Click below the last block: stop editing, or drop the selection, like
+    /// any other blank space. Otherwise, continue writing at the end.
     fn click_below(&mut self) {
-        if self.editing.is_some() {
+        if self.dragged {
+            return;
+        }
+        if self.editing.is_some() || self.selection.is_some() {
             self.request_edit(None, None);
             return;
         }
@@ -523,6 +651,344 @@ impl Editor {
         let (change, keep) = self.doc.splice(len, 0, vec![String::new()], Some(0));
         self.apply_change(change);
         self.set_editing(keep, 0);
+    }
+
+    /// A click on the text of block `i`, or in the padding around it
+    /// (`cursor`: where the caret goes; `None`, where the click put it). With
+    /// Shift, it extends the selection to the block instead.
+    fn clicked_block(&mut self, i: usize, cursor: Option<Cursor>) {
+        if self.dragged {
+            // Blocks were selected: Slint runs the change handlers that do it
+            // before it handles the press, which may give the text field of
+            // the block pressed on the focus after them. It's not edited, so
+            // the window takes the focus back, for the keys for the selection.
+            self.with_ui(|ui| ui.invoke_focus_root());
+            return;
+        }
+        if self.shift_held() && Some(i) != self.editing && self.extend_selection(i) {
+            return;
+        }
+        self.request_edit(Some(i), cursor);
+    }
+
+    // ----- selecting blocks --------------------------------------------------------
+
+    fn shift_held(&self) -> bool {
+        self.ui.upgrade().is_some_and(|ui| ui.get_modifiers().shift)
+    }
+
+    /// The blocks selected, first to last.
+    fn selected(&self) -> Option<std::ops::RangeInclusive<usize>> {
+        let (anchor, focus) = self.selection?;
+        Some(anchor.min(focus)..=anchor.max(focus))
+    }
+
+    /// Selects blocks `anchor` to `focus` as a whole (indices from before the
+    /// block being edited is committed). Editing stops, and the window takes
+    /// the focus for the keys that act on them.
+    fn select_blocks(&mut self, anchor: usize, focus: usize) {
+        let mut ends = Some((anchor, focus));
+        if let Some(i) = self.editing {
+            // Finishing the block can remove it (it's empty) or split it up.
+            let blocks = (self.commit(i) + 1) as usize;
+            ends = shift_range(anchor, focus, i, blocks);
+            self.set_editing(None, KEEP_CURSOR);
+        }
+        let last = self.doc.blocks.len() - 1;
+        let selection = ends.map(|(anchor, focus)| (anchor.min(last), focus.min(last)));
+        if self.selection != selection {
+            self.selection = selection;
+            self.show_selection();
+            self.set_status("", false);
+        }
+        self.with_ui(|ui| ui.invoke_focus_root());
+    }
+
+    fn select_all(&mut self) {
+        self.select_blocks(0, usize::MAX);
+    }
+
+    fn clear_selection(&mut self) {
+        if self.selection.take().is_some() {
+            self.show_selection();
+        }
+    }
+
+    fn show_selection(&self) {
+        let (first, last) = self.selected().map_or((-1, -1), |r| (*r.start() as i32, *r.end() as i32));
+        self.with_ui(|ui| {
+            ui.set_sel_first(first);
+            ui.set_sel_last(last);
+        });
+    }
+
+    /// Scrolls the block the selection was extended to into view.
+    fn show_selection_end(&self) {
+        if let Some((_, focus)) = self.selection {
+            self.with_ui(|ui| ui.invoke_show_row(focus as i32));
+        }
+    }
+
+    /// Shift+click on block `to`: selects the blocks from the start of the
+    /// selection, or from the block being edited, to it. Returns false if
+    /// there's neither.
+    fn extend_selection(&mut self, to: usize) -> bool {
+        let Some(anchor) = self.selection.map(|(a, _)| a).or(self.editing) else { return false };
+        self.select_blocks(anchor, to);
+        // A drag that goes on from here extends the same selection.
+        self.drag_origin = self.selection.map(|(a, _)| a);
+        true
+    }
+
+    /// A mouse button went down anywhere in the window: the release of the
+    /// last drag is past. With `drag`, it's the left button on the document,
+    /// which may drag a selection across blocks; without Shift, it ends the
+    /// selection.
+    fn button_pressed(&mut self, drag: bool) {
+        self.dragged = false;
+        if !drag {
+            return;
+        }
+        self.drag_origin = None;
+        if !self.shift_held() {
+            self.clear_selection();
+        }
+    }
+
+    /// While the button is held from a press on the document, the pointer is
+    /// over block `i`. Once it's past the block the drag started on, the
+    /// blocks from there to it are selected, and stay so until the release
+    /// (back on the first block, just that one).
+    fn drag_over(&mut self, i: usize) {
+        let origin = match self.drag_origin {
+            Some(origin) => origin,
+            None => {
+                // The block the press was on. With Shift, the start of the
+                // selection it extends, or the block being edited.
+                let anchor = if self.shift_held() { self.selection.map(|(a, _)| a).or(self.editing) } else { None };
+                *self.drag_origin.insert(anchor.unwrap_or(i))
+            }
+        };
+        if (i != origin || self.selection.is_some()) && self.selection != Some((origin, i)) {
+            self.select_blocks(origin, i);
+            // Where the block it started on is now, if finishing the block
+            // being edited moved it.
+            self.drag_origin = self.selection.map(|(anchor, _)| anchor);
+            self.dragged = true;
+        }
+    }
+
+    /// The Markdown of the blocks selected, as it is in the file.
+    fn selected_markdown(&self) -> String {
+        let Some(range) = self.selected() else { return String::new() };
+        let last = *range.end();
+        let mut text = String::new();
+        for k in range {
+            text.push_str(&self.doc.blocks[k].src);
+            if k < last {
+                text.push_str(&self.doc.blocks[k].gap);
+            }
+        }
+        text
+    }
+
+    /// The text of the blocks selected as they read rendered, a blank line
+    /// between blocks.
+    fn selected_plain(&self) -> String {
+        let Some(range) = self.selected() else { return String::new() };
+        let texts: Vec<String> = range
+            .map(|k| render::plain_text(&self.doc.blocks[k].src, &self.refs, None))
+            .filter(|t| !t.is_empty())
+            .collect();
+        texts.join("\n\n")
+    }
+
+    /// "1 block", "3 blocks": how many are selected.
+    fn selected_count(&self) -> String {
+        match self.selected().map_or(0, |r| r.count()) {
+            1 => "1 block".to_owned(),
+            n => format!("{n} blocks"),
+        }
+    }
+
+    /// Ctrl+C with blocks selected: their Markdown; with Shift, their text.
+    fn copy_selection(&self, plain: bool) {
+        let what = self.selected_count();
+        if plain {
+            self.copy_as(&self.selected_plain(), &what, "plain text");
+        } else {
+            self.copy_as(&self.selected_markdown(), &what, "Markdown");
+        }
+    }
+
+    /// Copies `text`, which is `what` as `how` ("plain text"), and says so.
+    fn copy_as(&self, text: &str, what: &str, how: &str) {
+        if text.is_empty() {
+            self.set_status(format!("Nothing to copy: no text in {what}"), false);
+        } else {
+            self.copy_text(text);
+            self.set_status(format!("Copied {what} as {how}"), false);
+        }
+    }
+
+    fn copy_text(&self, text: &str) {
+        self.with_ui(|ui| ui.invoke_copy_text(text.into()));
+    }
+
+    fn clipboard_text(&self) -> String {
+        self.ui.upgrade().map(|ui| ui.invoke_clipboard_text().to_string()).unwrap_or_default()
+    }
+
+    /// Replaces the blocks selected with `parts`, and edits part `edit` with
+    /// the caret at `cursor`.
+    fn replace_selection(&mut self, parts: Vec<String>, edit: usize, cursor: usize) {
+        let (Some(range), Some((anchor, focus))) = (self.selected(), self.selection) else { return };
+        let before = self.doc.clone();
+        self.clear_selection();
+        self.drag_origin = None;
+        let (change, keep) = self.doc.splice(*range.start(), range.count(), parts, Some(edit));
+        self.update_modified();
+        self.apply_change(change);
+        self.set_editing(keep, cursor as i32);
+        // The kept block was inserted as typed: normalise it when editing
+        // finishes even if nothing more is typed.
+        self.original.clear();
+        self.refresh_meta();
+        self.set_status("", false);
+        self.undo = Some(Undo { doc: before, was: Was::Selected(anchor, focus), after: self.file_text() });
+    }
+
+    /// The document as it was before a paste into block `from.block`, which
+    /// is being edited, and what was edited then: what Ctrl+Z puts back.
+    fn before_paste(&self, from: PasteFrom) -> (Document, Was) {
+        let mut doc = self.doc.clone();
+        doc.blocks[from.block].src = from.text;
+        (doc, Was::Editing { block: from.block, caret: from.caret, original: from.original })
+    }
+
+    /// Ctrl+Z when the text field has nothing left to undo, or no block is
+    /// edited: puts back the blocks that were deleted or replaced as a whole,
+    /// or pasted, if the document still reads as that change left it. A change
+    /// that no longer applies is forgotten. Returns whether it undid one.
+    fn undo_blocks(&mut self) -> bool {
+        let Some(undo) = self.undo.take() else { return false };
+        if undo.after != self.file_text() {
+            return false;
+        }
+        let Undo { doc, was, .. } = undo;
+        let edited = self.editing.take();
+        self.clear_selection();
+        self.replace_doc(doc, edited);
+        self.update_modified();
+        self.refresh_meta();
+        match was {
+            Was::Selected(anchor, focus) => {
+                self.set_editing(None, KEEP_CURSOR);
+                self.selection = Some((anchor, focus));
+                self.show_selection();
+                self.with_ui(|ui| ui.invoke_focus_root());
+            }
+            Was::Editing { block, caret, original } => {
+                self.set_editing(Some(block), caret as i32);
+                // As it was when the paste was made, so that the block is
+                // finished as it would have been then (an unclosed fence
+                // typed in it gets closed).
+                self.original = original;
+            }
+        }
+        self.set_status("", false);
+        true
+    }
+
+    /// Puts `doc` in place of the document, and renders again only the
+    /// blocks that differ from it, and block `edited`, whose row shows what
+    /// was typed in it.
+    fn replace_doc(&mut self, doc: Document, edited: Option<usize>) {
+        let old = std::mem::replace(&mut self.doc, doc);
+        let (old, new) = (&old.blocks, &self.doc.blocks);
+        let same = |k: usize, a: &doc::Block, b: &doc::Block| a.src == b.src && Some(k) != edited;
+        let prefix = old.iter().zip(new).enumerate().take_while(|(k, (a, b))| same(*k, a, b)).count();
+        let room = old.len().min(new.len()) - prefix;
+        let suffix = old
+            .iter()
+            .rev()
+            .zip(new.iter().rev())
+            .take(room)
+            .enumerate()
+            .take_while(|(k, (a, b))| same(old.len() - 1 - k, a, b))
+            .count();
+        let change = Change { start: prefix, removed: old.len() - prefix - suffix, inserted: new.len() - prefix - suffix };
+        self.apply_change(change);
+    }
+
+    /// Deletes the blocks selected, leaving an empty paragraph to type in.
+    fn delete_selection(&mut self) {
+        self.replace_selection(vec![String::new()], 0, 0);
+    }
+
+    /// Ctrl+V with blocks selected: the text on the clipboard replaces them,
+    /// split into blocks, and editing goes on at its end.
+    fn paste_over_selection(&mut self) {
+        let text = ops::unix_newlines(&self.clipboard_text());
+        if text.trim().is_empty() {
+            return;
+        }
+        let (parts, edit, cursor) = ops::split_at_caret(&text, text.len());
+        self.replace_selection(parts, edit, cursor);
+    }
+
+    /// A key while no block is being edited, so the window has the focus.
+    /// Ctrl+A selects all blocks; with blocks selected, the keys act on them.
+    /// Returns whether the key was used.
+    fn doc_key(&mut self, text: &str, m: Modifiers) -> bool {
+        let command = m.control && !m.alt && !m.meta;
+        let letter = text.to_lowercase();
+        if command && !m.shift && letter == "a" {
+            self.select_all();
+            return true;
+        }
+        if command && !m.shift && letter == "z" {
+            return self.undo_blocks();
+        }
+        let Some((anchor, focus)) = self.selection else { return false };
+        let key = |k: Key| text == SharedString::from(k).as_str();
+        if command {
+            match (letter.as_str(), m.shift) {
+                ("c", plain) => self.copy_selection(plain),
+                ("x", false) => {
+                    let what = self.selected_count();
+                    self.copy_text(&self.selected_markdown());
+                    self.delete_selection();
+                    self.set_status(format!("Cut {what}"), false);
+                }
+                ("v", false) => self.paste_over_selection(),
+                _ => return false,
+            }
+            return true;
+        }
+        let Some(range) = self.selected() else { return false };
+        if key(Key::Escape) {
+            self.clear_selection();
+        } else if key(Key::Backspace) || key(Key::Delete) {
+            self.delete_selection();
+        } else if m.shift && (key(Key::UpArrow) || key(Key::DownArrow)) {
+            let last = self.doc.blocks.len() - 1;
+            let focus = if key(Key::UpArrow) { focus.saturating_sub(1) } else { (focus + 1).min(last) };
+            self.select_blocks(anchor, focus);
+            self.show_selection_end();
+        } else if key(Key::UpArrow) || key(Key::LeftArrow) {
+            self.request_edit(Some(*range.start()), Some(Cursor::At(0)));
+        } else if key(Key::DownArrow) || key(Key::RightArrow) || key(Key::Return) {
+            self.request_edit(Some(*range.end()), Some(Cursor::End));
+        } else if is_typed_text(text) && !m.control && !m.alt && !m.meta {
+            // Typing replaces the blocks, as it replaces selected text.
+            self.replace_selection(vec![text.to_owned()], 0, text.len());
+        } else if key(Key::Tab) || key(Key::Backtab) {
+            // Not on to the text field of some block.
+        } else {
+            return false;
+        }
+        true
     }
 
     // ----- files -----------------------------------------------------------------
@@ -547,6 +1013,11 @@ impl Editor {
             }
         };
         self.editing = None;
+        self.clear_selection();
+        self.drag_origin = None;
+        self.dragged = false;
+        self.undo = None;
+        self.paste_from = None;
         self.images.clear();
         self.doc = Document::parse(&text);
         self.saved_text = text;
@@ -693,6 +1164,27 @@ fn finish_block(doc: &mut Document, i: usize, original: &str) -> Option<Change> 
         return None;
     }
     Some(doc.splice(i, 1, vec![src], None).0)
+}
+
+/// Where the ends of a range of blocks, `anchor` and `focus`, are once block
+/// `i` has become `n` blocks (none if it was removed, several if it was split
+/// up): the range takes in all of them if it reached block `i`, and nothing
+/// that came before or after it. `None` if the range was block `i` alone, and
+/// it's gone.
+fn shift_range(anchor: usize, focus: usize, i: usize, n: usize) -> Option<(usize, usize)> {
+    if anchor == i && focus == i {
+        return (n > 0).then(|| (i, i + n - 1));
+    }
+    // `other` is the other end, which isn't block `i` (so with `n` 0 and
+    // `other` before it, `i` isn't 0). An end past the last block (Ctrl+A
+    // selects up to `usize::MAX`) stays past it.
+    let shift = |end: usize, other: usize| match end.cmp(&i) {
+        std::cmp::Ordering::Less => end,
+        std::cmp::Ordering::Greater => end.saturating_add(n) - 1,
+        std::cmp::Ordering::Equal if other > i => i,
+        std::cmp::Ordering::Equal => i + n - 1,
+    };
+    Some((shift(anchor, focus), shift(focus, anchor)))
 }
 
 /// Writes `data` to a temporary file next to `path` and renames it over
@@ -914,10 +1406,10 @@ fn monospace_family() -> Option<String> {
     (!first.is_empty()).then(|| first.to_owned())
 }
 
-/// Window events that need winit: dropped files, the mouse wheel, the scale,
-/// and the pointer position.
+/// Window events that need winit: dropped files, the mouse wheel and left
+/// button, the scale, and the pointer position.
 fn install_window_events(app: &App, editor: Rc<RefCell<Editor>>) {
-    use slint::winit_030::winit::event::WindowEvent;
+    use slint::winit_030::winit::event::{MouseButton, WindowEvent};
     use slint::winit_030::{EventResult, WinitWindowAccessor};
 
     let weak = app.as_weak();
@@ -931,6 +1423,26 @@ fn install_window_events(app: &App, editor: Rc<RefCell<Editor>>) {
                 pointer_in.set(Some(slint::LogicalPosition::new((position.x / scale) as f32, (position.y / scale) as f32)));
             }
             WindowEvent::CursorLeft { .. } => pointer_in.set(None),
+            // Before Slint sees it: a text field takes the events of the press
+            // it gets, so the window can't tell that the button is held while
+            // it drags a selection on to other blocks (see App.drag-armed).
+            // Any button: a middle click after a drag isn't part of it.
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(ui) = weak.upgrade() {
+                    let left = *button == MouseButton::Left;
+                    if state.is_pressed() {
+                        ui.invoke_pointer_pressed(left);
+                    } else if left {
+                        ui.invoke_pointer_released();
+                    }
+                }
+            }
+            // The release may go to another window.
+            WindowEvent::Focused(false) => {
+                if let Some(ui) = weak.upgrade() {
+                    ui.invoke_pointer_released();
+                }
+            }
             // Before the list scrolls, and may drop the text field that has the
             // focus along with the keys: see park-focus.
             WindowEvent::MouseWheel { .. } => {
@@ -1101,7 +1613,7 @@ fn wire_settings(app: &App, editor: &Rc<RefCell<Editor>>, settings: Option<PathB
         // Stop editing: Tab moves the focus between the dialog's fields, and
         // shouldn't move it to the block behind it.
         if let Ok(mut ed) = ed.try_borrow_mut() {
-            ed.click_blank();
+            ed.leave_edit();
         }
         let entries = path.as_deref().map(read_settings).unwrap_or_default();
         let rows = entries.into_iter().filter_map(|(key, referer)| {
@@ -1197,8 +1709,14 @@ fn wire(app: &App, editor: &Rc<RefCell<Editor>>) {
             -1 => Some(Cursor::End),
             _ => None,
         };
-        ed.borrow_mut().request_edit(Some(i as usize), cursor)
+        ed.borrow_mut().clicked_block(i as usize, cursor)
     });
+    let ed = Rc::downgrade(editor);
+    app.on_button_pressed(move |drag| with_editor(&ed, move |ed| ed.button_pressed(drag)));
+    let ed = Rc::downgrade(editor);
+    app.on_drag_over(move |i| with_editor(&ed, move |ed| ed.drag_over(i as usize)));
+    let ed = editor.clone();
+    app.on_doc_key(move |text, modifiers| ed.borrow_mut().doc_key(&text, modifiers));
     let ed = editor.clone();
     app.on_click_below(move || ed.borrow_mut().click_below());
     let ed = editor.clone();
@@ -1240,6 +1758,24 @@ fn wire(app: &App, editor: &Rc<RefCell<Editor>>) {
     app.window().on_close_requested(move || {
         let Ok(mut ed) = ed.try_borrow_mut() else { return CloseRequestResponse::KeepWindowShown };
         if ed.guard(Pending::Close) { CloseRequestResponse::HideWindow } else { CloseRequestResponse::KeepWindowShown }
+    });
+}
+
+/// Runs `f` on the editor, or right after if it's busy: for callbacks from
+/// change handlers, which may run while it updates the UI.
+fn with_editor(editor: &std::rc::Weak<RefCell<Editor>>, f: impl FnOnce(&mut Editor) + 'static) {
+    let Some(ed) = editor.upgrade() else { return };
+    if let Ok(mut ed) = ed.try_borrow_mut() {
+        f(&mut ed);
+        return;
+    }
+    let editor = editor.clone();
+    slint::Timer::single_shot(Duration::ZERO, move || {
+        if let Some(ed) = editor.upgrade()
+            && let Ok(mut ed) = ed.try_borrow_mut()
+        {
+            f(&mut ed);
+        }
     });
 }
 
@@ -1419,6 +1955,26 @@ mod tests {
         if let Some(path) = settings_path() {
             assert!(path.ends_with(Path::new("linter").join("settings")), "{}", path.display());
         }
+    }
+
+    #[test]
+    fn selection_ends_follow_the_finished_block() {
+        // Block 1 unchanged: only the blocks after it would have moved.
+        assert_eq!(shift_range(1, 0, 1, 1), Some((1, 0)));
+        // Block 2 removed (it was empty): a selection from it upward starts
+        // at the block before it, one downward at the block after it.
+        assert_eq!(shift_range(2, 0, 2, 0), Some((1, 0)));
+        assert_eq!(shift_range(2, 4, 2, 0), Some((2, 3)));
+        assert_eq!(shift_range(5, 2, 2, 0), Some((4, 2)));
+        assert_eq!(shift_range(2, 2, 2, 0), None);
+        // Block 2 split in three: all of it stays selected.
+        assert_eq!(shift_range(2, 0, 2, 3), Some((4, 0)));
+        assert_eq!(shift_range(2, 3, 2, 3), Some((2, 5)));
+        assert_eq!(shift_range(2, 2, 2, 3), Some((2, 4)));
+        assert_eq!(shift_range(0, 1, 2, 3), Some((0, 1)));
+        // Ctrl+A while block 2 is edited.
+        assert!(shift_range(0, usize::MAX, 2, 3).is_some_and(|(a, f)| a == 0 && f > 1000));
+        assert!(shift_range(0, usize::MAX, 2, 0).is_some_and(|(a, f)| a == 0 && f > 1000));
     }
 
     #[test]
